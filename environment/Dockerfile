@@ -18,5 +18,4 @@ RUN python -m pip install \
 
 COPY --chown=agent:agent task/ /workspace/
 
-USER agent
 WORKDIR /workspace
