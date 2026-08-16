@@ -1,0 +1,39 @@
+$ ./scripts/reproduce.sh
+=== roundtrip ===
+resources_type dict
+duration_type str
+project_name None
+pre_launch None
+post_launch None
+launcher None
+Traceback (most recent call last):
+  File "/workspace/tools/incident_probe.py", line 68, in roundtrip_probe
+    assert isinstance(restored.resources, ResourceSpecV1)
+AssertionError
+roundtrip: FAILED
+=== batch ===
+slurm: ["#SBATCH --time='1 day, 2:03:04'", "#SBATCH --qos=\"normal\""]
+Traceback (most recent call last):
+  File "/workspace/tools/incident_probe.py", line 107, in batch_probe
+    assert directive in script, f"{scheduler} missing {directive!r}"
+AssertionError: slurm missing '#SBATCH --time=1-02:03:04'
+batch: FAILED
+=== wait ===
+Traceback (most recent call last):
+  File "/workspace/tools/incident_probe.py", line 114, in wait_probe
+    status = completed.wait(timeout=timedelta(milliseconds=50), target_states=[JobState.QUEUED])
+  File "/workspace/src/psij/job.py", line 197, in wait
+    raise UnreachableStateException(status)
+psij.exceptions.UnreachableStateException: JobStatus[COMPLETED, time=<monotonic timestamp>, exit_code=0]
+wait: FAILED
+=== launcher ===
+normal_marker_is_failure True
+Traceback (most recent call last):
+  File "/workspace/tools/incident_probe.py", line 129, in launcher_probe
+    assert classified_failure is False
+AssertionError
+launcher: FAILED
+
+Captured from the unmodified starter in the pinned container. The transient
+status timestamp and temporary-path frames were normalized; error types and
+observed values are unchanged.

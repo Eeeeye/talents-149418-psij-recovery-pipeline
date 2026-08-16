@@ -1,0 +1,39 @@
+schema_version = "1.1"
+
+[task]
+name = "talents/psij-recovery-pipeline"
+description = "Repair restart-safe PSI/J job persistence, scheduler rendering, state waits, and launcher error classification."
+authors = []
+keywords = ["hpc", "psij", "batch-scheduler", "persistence", "recovery"]
+
+[metadata]
+difficulty = "hard"
+difficulty_explanation = "The observable failure crosses persistent JobSpec recovery, three scheduler dialects, asynchronous state ordering, and launcher/user-error classification. Several independent defects must be repaired together; a local one-file fix is insufficient."
+category = "systems-engineering"
+
+[verifier]
+timeout_sec = 300.0
+user = "root"
+
+[agent]
+timeout_sec = 1800.0
+user = "agent"
+
+[environment]
+build_timeout_sec = 900.0
+cpus = 2
+memory_mb = 2048
+storage_mb = 4096
+gpus = 0
+allow_internet = false
+mcp_servers = []
+
+[environment.healthcheck]
+command = "python3 scripts/healthcheck.py"
+interval_sec = 2.0
+timeout_sec = 20.0
+retries = 3
+
+[verifier.env]
+
+[solution.env]

@@ -1,0 +1,37 @@
+{
+  "version": 0.1,
+  "type": "JobSpec",
+  "data": {
+    "name": "legacy-cfd-restart",
+    "executable": "/opt/cfd/bin/solver",
+    "arguments": ["--mesh", "wing 17.msh"],
+    "directory": "/scratch/cfd/restart 17",
+    "inherit_environment": false,
+    "environment": {
+      "OMP_NUM_THREADS": "6",
+      "CASE_ID": "wing-17"
+    },
+    "stdin_path": null,
+    "stdout_path": "/scratch/cfd/restart 17/stdout.log",
+    "stderr_path": "/scratch/cfd/restart 17/stderr.log",
+    "resources": {
+      "node_count": 2,
+      "process_count": 12,
+      "process_per_node": 6,
+      "cpu_cores_per_process": 6,
+      "gpu_cores_per_process": 1,
+      "exclusive_node_use": true
+    },
+    "attributes": {
+      "duration": "1 day, 2:03:04",
+      "queue_name": "gpu",
+      "project_name": "aero",
+      "reservation_id": "maint-17",
+      "custom_attributes": {
+        "slurm.qos": "normal",
+        "slurm.constraint": "a100"
+      }
+    },
+    "launcher": "single"
+  }
+}
