@@ -25,7 +25,6 @@ cpus = 2
 memory_mb = 2048
 storage_mb = 4096
 gpus = 0
-allow_internet = false
 mcp_servers = []
 
 [environment.healthcheck]

@@ -156,6 +156,10 @@ false launcher-failure message.
 - Do not invoke real scheduler commands and do not require scheduler daemons.
 - Do not change resource constraint validation, environment inheritance,
   callback transition reconstruction, or the meaning of final job states.
+- Keep the built-in multiple launcher's concurrent worker behavior. Each
+  worker must remain bounded by the positive-seconds
+  `PSIJ_MULTI_LAUNCH_TIMEOUT_SECONDS` override (default `1800`), and a worker
+  timeout or launcher interruption must not leave worker descendants running.
 - Do not replace PSI/J with a separate implementation or hard-code the probe
   fixtures.
 
@@ -164,7 +168,8 @@ false launcher-failure message.
 You may modify files only under `/workspace/src/psij/`. Do not modify the
 reproduction scripts, examples, packaging metadata, dependency locks, or
 runtime environment. Do not install or download dependencies. The supplied
-environment is complete and grading runs without network access.
+environment is complete, and the task does not require an external service or
+download even when internet access is available.
 
 The final checks are:
 

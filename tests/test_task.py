@@ -45,6 +45,15 @@ def token(prefix: str) -> str:
     return prefix + secrets.token_hex(6)
 
 
+def process_is_running(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    fields_after_name = stat.rsplit(")", 1)[1].split()
+    return bool(fields_after_name) and fields_after_name[0] != "Z"
+
+
 def complete_spec(*, duration: timedelta | None = None,
                   custom: Dict[str, object] | None = None) -> JobSpec:
     suffix = secrets.token_hex(5)
@@ -408,6 +417,135 @@ class PreservedBehaviorTests(unittest.TestCase):
             output = (root / "stdout.log").read_text(encoding="utf-8")
             self.assertIn(f"ONLY_TEST_VALUE={marker}", output)
             self.assertNotIn("PYTHONPATH=", output)
+
+    def test_multiple_launcher_bounds_and_reaps_worker_descendants(self) -> None:
+        launcher = ROOT / "src/psij/launchers/scripts/multi_launch.sh"
+        with tempfile.TemporaryDirectory(prefix="psij-multi-timeout-") as td:
+            root = Path(td)
+            pid_dir = root / "pids"
+            pid_dir.mkdir()
+            env = os.environ.copy()
+            env["PSIJ_MULTI_LAUNCH_TIMEOUT_SECONDS"] = "1"
+            env["PSIJ_TEST_PID_DIR"] = str(pid_dir)
+            child = (
+                "import os, pathlib, subprocess; "
+                "process = subprocess.Popen(['sleep', '30']); "
+                "pathlib.Path(os.environ['PSIJ_TEST_PID_DIR'], "
+                "os.environ['_PSI_J_PROCESS_INDEX_'] + '.pid').write_text(str(process.pid)); "
+                "process.wait()"
+            )
+            command = [
+                "/bin/bash",
+                str(launcher),
+                "timeout-test",
+                str(root / "launcher.log"),
+                "",
+                "",
+                "/dev/null",
+                str(root / "stdout.log"),
+                str(root / "stderr.log"),
+                "2",
+                sys.executable,
+                "-c",
+                child,
+            ]
+            started = time.monotonic()
+            result = subprocess.run(
+                command,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            elapsed = time.monotonic() - started
+            worker_pids = [int(path.read_text()) for path in sorted(pid_dir.glob("*.pid"))]
+            try:
+                self.assertEqual(len(worker_pids), 2)
+                self.assertEqual(result.returncode, 124, result.stderr)
+                self.assertLess(elapsed, 4.5)
+                self.assertEqual(result.stdout, "_PSI_J_LAUNCHER_DONE\n")
+                for _ in range(20):
+                    if all(not process_is_running(pid) for pid in worker_pids):
+                        break
+                    time.sleep(0.05)
+                for pid in worker_pids:
+                    self.assertFalse(process_is_running(pid),
+                                     f"timed-out worker descendant survived: {pid}")
+            finally:
+                for pid in worker_pids:
+                    try:
+                        os.kill(pid, 9)
+                    except ProcessLookupError:
+                        pass
+
+    def test_multiple_launcher_interrupt_cleans_worker_descendants(self) -> None:
+        launcher = ROOT / "src/psij/launchers/scripts/multi_launch.sh"
+        with tempfile.TemporaryDirectory(prefix="psij-multi-signal-") as td:
+            root = Path(td)
+            pid_dir = root / "pids"
+            pid_dir.mkdir()
+            env = os.environ.copy()
+            env["PSIJ_MULTI_LAUNCH_TIMEOUT_SECONDS"] = "30"
+            env["PSIJ_TEST_PID_DIR"] = str(pid_dir)
+            child = (
+                "import os, pathlib, subprocess; "
+                "process = subprocess.Popen(['sleep', '30']); "
+                "pathlib.Path(os.environ['PSIJ_TEST_PID_DIR'], "
+                "os.environ['_PSI_J_PROCESS_INDEX_'] + '.pid').write_text(str(process.pid)); "
+                "process.wait()"
+            )
+            command = [
+                "/bin/bash",
+                str(launcher),
+                "signal-test",
+                str(root / "launcher.log"),
+                "",
+                "",
+                "/dev/null",
+                str(root / "stdout.log"),
+                str(root / "stderr.log"),
+                "2",
+                sys.executable,
+                "-c",
+                child,
+            ]
+            process = subprocess.Popen(
+                command,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            worker_pids: list[int] = []
+            try:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    paths = sorted(pid_dir.glob("*.pid"))
+                    if len(paths) == 2:
+                        worker_pids = [int(path.read_text()) for path in paths]
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(len(worker_pids), 2)
+                process.terminate()
+                process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 143)
+                for _ in range(20):
+                    if all(not process_is_running(pid) for pid in worker_pids):
+                        break
+                    time.sleep(0.05)
+                for pid in worker_pids:
+                    self.assertFalse(process_is_running(pid),
+                                     f"interrupted worker descendant survived: {pid}")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+                for pid in worker_pids:
+                    try:
+                        os.kill(pid, 9)
+                    except ProcessLookupError:
+                        pass
 
 
 def render_script(executor_type: Type[BatchSchedulerExecutor], config: object,
