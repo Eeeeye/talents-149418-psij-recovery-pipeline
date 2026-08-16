@@ -49,9 +49,10 @@ TYPES = [_PluginType('executors', JobExecutor.register_executor),
 def _load_plugins(root: str, full_path: str, mod: pkgutil.ModuleInfo) -> None:
     if mod.ispkg:
         return
-    logger.debug('Attempting to load %s from %s', mod.name, path)
-    spec = mod.module_finder.find_spec(mod.name, None)
+    logger.debug('Attempting to load %s from %s', mod.name, full_path)
+    full_mod_path = full_path
     try:
+        spec = mod.module_finder.find_spec(mod.name, None)
         if spec is None:
             raise Exception('Could not find module "%s"' % mod.name)
         im = importlib.util.module_from_spec(spec)

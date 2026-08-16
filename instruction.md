@@ -215,6 +215,13 @@ A scheduler row that is still present retains its reported PSI/J status.
   callback transition reconstruction, or the meaning of final job states.
 - Keep queue polling daemonized and scheduler-free verification deterministic;
   do not invoke real status commands from the probes or tests.
+- Keep optional plugin discovery diagnostic-safe: enabling DEBUG logging or
+  encountering a missing plugin descriptor must log and skip that descriptor,
+  not abort PSI/J package initialization.
+- Keep Flux submission stream mapping intact. When a Flux job supplies
+  `stdin_path`, `stdout_path`, or `stderr_path`, assign each path to the same
+  `JobspecV1` object that is submitted. Verification replaces the optional
+  Flux bindings with an in-process stub and does not contact a Flux service.
 - Keep the built-in multiple launcher's concurrent worker behavior. Each
   worker must remain bounded by the positive-seconds
   `PSIJ_MULTI_LAUNCH_TIMEOUT_SECONDS` override (default `1800`), and a worker

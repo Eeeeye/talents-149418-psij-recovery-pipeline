@@ -2,10 +2,13 @@
 import io
 import gc
 import hashlib
+import importlib.util
 import json
+import logging
 import math
 import multiprocessing
 import os
+import pkgutil
 import random
 import re
 import secrets
@@ -14,12 +17,14 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import warnings
 import weakref
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Iterable, Tuple, Type
+from unittest import mock
 
 
 ROOT = Path("/workspace")
@@ -476,6 +481,95 @@ class ModificationBoundaryTests(unittest.TestCase):
 
 
 class PreservedBehaviorTests(unittest.TestCase):
+    def test_plugin_discovery_debug_logging_survives_a_missing_descriptor(self) -> None:
+        import psij
+
+        class MissingModuleFinder:
+            def find_spec(self, name: str, path: object = None) -> None:
+                return None
+
+        plugin_path = f"/tmp/{token('plugins-')}/psij-descriptors"
+        module = pkgutil.ModuleInfo(
+            MissingModuleFinder(), token("missing_descriptor_"), False
+        )
+        with self.assertLogs(psij.logger, level=logging.DEBUG) as captured:
+            psij._load_plugins("/tmp/plugin-root", plugin_path, module)
+        diagnostics = "\n".join(captured.output)
+        self.assertIn(plugin_path, diagnostics)
+        self.assertIn(module.name, diagnostics)
+
+    def test_flux_stderr_path_is_assigned_to_the_submitted_jobspec(self) -> None:
+        class FakeFluxJobspec:
+            created: "FakeFluxJobspec | None" = None
+
+            def __init__(self) -> None:
+                self.stdin: Path | None = None
+                self.stdout: Path | None = None
+                self.stderr: Path | None = None
+                self.duration: float | None = None
+
+            @classmethod
+            def from_command(cls, argv: list[str], **kwargs: object) -> "FakeFluxJobspec":
+                cls.created = cls()
+                return cls.created
+
+        class FakeFluxExecutorFuture:
+            pass
+
+        flux_module = types.ModuleType("flux")
+        flux_job_module = types.ModuleType("flux.job")
+        flux_job_module.FluxExecutorFuture = FakeFluxExecutorFuture  # type: ignore[attr-defined]
+        flux_job_module.JobspecV1 = FakeFluxJobspec  # type: ignore[attr-defined]
+        flux_module.job = flux_job_module  # type: ignore[attr-defined]
+
+        module_name = token("psij_flux_regression_")
+        source = ROOT / "src/psij/executors/flux.py"
+        module_spec = importlib.util.spec_from_file_location(module_name, source)
+        self.assertIsNotNone(module_spec)
+        assert module_spec is not None and module_spec.loader is not None
+        flux_executor_module = importlib.util.module_from_spec(module_spec)
+        with mock.patch.dict(
+            sys.modules, {"flux": flux_module, "flux.job": flux_job_module}
+        ):
+            module_spec.loader.exec_module(flux_executor_module)
+
+        submitted: list[FakeFluxJobspec] = []
+
+        class RecordingExecutor:
+            def submit(self, jobspec: FakeFluxJobspec) -> object:
+                submitted.append(jobspec)
+                return object()
+
+        executor = object.__new__(flux_executor_module.FluxJobExecutor)
+        executor._flux_executor = RecordingExecutor()
+        executor._check_job = lambda job: job.spec
+        executor._add_flux_callbacks = lambda job, future: None
+
+        stdin_path = Path(f"/tmp/{token('flux-stdin-')}.txt")
+        stdout_path = Path(f"/tmp/{token('flux-stdout-')}.log")
+        stderr_path = Path(f"/tmp/{token('flux-stderr-')}.log")
+        job = Job(JobSpec(
+            executable="/bin/echo",
+            arguments=["offline"],
+            stdin_path=stdin_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            resources=ResourceSpecV1(
+                process_count=1,
+                cpu_cores_per_process=1,
+                exclusive_node_use=False,
+            ),
+            attributes=JobAttributes(duration=timedelta(seconds=17)),
+        ))
+        executor.submit(job)
+
+        self.assertEqual(len(submitted), 1)
+        self.assertIs(submitted[0], FakeFluxJobspec.created)
+        self.assertEqual(submitted[0].stdin, stdin_path)
+        self.assertEqual(submitted[0].stdout, stdout_path)
+        self.assertEqual(submitted[0].stderr, stderr_path)
+        self.assertEqual(submitted[0].duration, 17.0)
+
     def test_resource_constraint_validation_is_unchanged(self) -> None:
         with self.assertRaises(InvalidJobException):
             ResourceSpecV1(node_count=2, process_count=5, processes_per_node=2)
