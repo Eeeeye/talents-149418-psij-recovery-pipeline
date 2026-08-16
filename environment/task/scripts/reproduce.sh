@@ -4,7 +4,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 failed=0
-for probe in roundtrip batch wait launcher; do
+for probe in roundtrip batch wait launcher recovery; do
     echo "=== ${probe} ==="
     if python3 tools/incident_probe.py "${probe}"; then
         echo "${probe}: OK"

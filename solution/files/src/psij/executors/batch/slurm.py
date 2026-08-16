@@ -153,8 +153,9 @@ class SlurmJobExecutor(BatchSchedulerExecutor):
         for line in lines:
             if not line:
                 continue
-            cols = line.split()
-            assert len(cols) == 3
+            cols = line.split(maxsplit=2)
+            if len(cols) != 3:
+                raise ValueError('Malformed squeue status row: %r' % line)
             native_id = cols[0]
             state = self._get_state(cols[1])
             msg = self._get_message(cols[2]) if state == JobState.FAILED else None
@@ -163,12 +164,13 @@ class SlurmJobExecutor(BatchSchedulerExecutor):
         return r
 
     def _get_state(self, state: str) -> JobState:
-        assert state in SlurmJobExecutor._STATE_MAP
-        return SlurmJobExecutor._STATE_MAP[state]
+        try:
+            return SlurmJobExecutor._STATE_MAP[state]
+        except KeyError as error:
+            raise ValueError('Unknown Slurm state: %s' % state) from error
 
     def _get_message(self, reason: str) -> str:
-        assert reason in SlurmJobExecutor._REASONS_MAP
-        return SlurmJobExecutor._REASONS_MAP[reason]
+        return SlurmJobExecutor._REASONS_MAP.get(reason, reason)
 
     def job_id_from_submit_output(self, out: str) -> str:
         """See :meth:`~.BatchSchedulerExecutor.job_id_from_submit_output`."""

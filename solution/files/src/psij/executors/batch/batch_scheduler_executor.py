@@ -1,14 +1,16 @@
 import logging
 import math
 import os
+import re
 import subprocess
 import time
 import traceback
+import weakref
 from abc import abstractmethod
 from datetime import timedelta
 from pathlib import Path
-from threading import Thread, RLock
-from typing import Optional, List, Dict, Collection, cast, TextIO, Union
+from threading import Event, Thread, RLock
+from typing import Optional, List, Dict, Collection, cast, TextIO, Tuple, Union
 
 from .escape_functions import bash_escape
 from psij.launchers.script_based_launcher import ScriptBasedLauncher
@@ -21,6 +23,8 @@ from psij.executors.batch.template_function_library import ALL as FUNCTION_LIBRA
 UNKNOWN_ERROR = 'PSIJ: Unknown error'
 
 logger = logging.getLogger(__name__)
+
+_EXIT_CODE_RECORD = re.compile(r'^-?[0-9]+\r?\n\Z')
 
 
 def check_status_exit_code(command: str, exit_code: int, out: str) -> None:
@@ -70,7 +74,8 @@ class BatchSchedulerExecutorConfig(JobExecutorConfig):
                  work_directory: Optional[Path] = None, queue_polling_interval: int = 30,
                  initial_queue_polling_delay: int = 2,
                  queue_polling_error_threshold: int = 2,
-                 keep_files: bool = False):
+                 keep_files: bool = False,
+                 completion_grace_period: float = 2.0):
         """Initializes a base batch scheduler executor configuration.
 
         Parameters
@@ -92,11 +97,20 @@ class BatchSchedulerExecutorConfig(JobExecutorConfig):
         keep_files
             Whether to keep submit files and auxiliary job files (exit code and output files) after
             a job has completed.
+        completion_grace_period
+            The positive, finite number of seconds to wait for completion evidence after a job
+            disappears from the scheduler queue.
         """
-        super().__init__(work_directory, launcher_log_file)
+        super().__init__(launcher_log_file, work_directory)
         self.queue_polling_interval = queue_polling_interval
         self.initial_queue_polling_delay = initial_queue_polling_delay
         self.queue_polling_error_threshold = queue_polling_error_threshold
+        if isinstance(completion_grace_period, bool) or not isinstance(
+                completion_grace_period, (int, float)):
+            raise TypeError('completion_grace_period must be a number')
+        if not math.isfinite(completion_grace_period) or completion_grace_period <= 0:
+            raise ValueError('completion_grace_period must be positive and finite')
+        self.completion_grace_period = float(completion_grace_period)
         self.keep_files = keep_files
         if 'PSIJ_BATCH_KEEP_FILES' in os.environ:
             self.keep_files = True
@@ -475,14 +489,15 @@ class BatchSchedulerExecutor(JobExecutor):
         qp_thread.start()
         return qp_thread
 
-    def _set_job_status(self, job: Job, status: JobStatus) -> None:
+    def _set_job_status(self, job: Job, status: JobStatus,
+                        completion_evidence_checked: bool = False) -> None:
         if status.state.is_greater_than(job.status.state) is False:
             # is_greater_than returns T/F if the states are comparable and None if not, so
             # we have to check explicitly for the boolean value rather than truthiness
             return
         if status.state.final and job.native_id:
             self._clean_submit_script(job)
-            self._read_aux_files(job, status)
+            self._read_aux_files(job, status, completion_evidence_checked)
         super()._set_job_status(job, status)
 
     def _clean_submit_script(self, job: Job) -> None:
@@ -491,10 +506,14 @@ class BatchSchedulerExecutor(JobExecutor):
             if not self.config.keep_files:
                 submit_file_path = self.work_directory / (job.id + '.job')
                 submit_file_path.unlink()
+        except FileNotFoundError:
+            # Attached/recovered jobs do not necessarily have a local submit script.
+            pass
         except Exception as ex:
             logger.warning('Job %s: failed clean submit script: %s', job.id, ex)
 
-    def _read_aux_files(self, job: Job, status: JobStatus) -> None:
+    def _read_aux_files(self, job: Job, status: JobStatus,
+                        completion_evidence_checked: bool = False) -> None:
         try:
             if logger.isEnabledFor(logging.DEBUG):
                 launcher_log = self._read_aux_file(path=self.work_directory
@@ -505,11 +524,12 @@ class BatchSchedulerExecutor(JobExecutor):
                 # exit code and other things are not very meaningful for canceled jobs
                 return
             # read exit code and output files
-            exit_code_str = self._read_aux_file(job, '.ec')
-            if exit_code_str:
-                status.exit_code = int(exit_code_str)
-                if status.exit_code != 0:
-                    status.state = JobState.FAILED
+            if status.exit_code is None and not completion_evidence_checked:
+                exit_code_str = self._read_aux_file(job, '.ec')
+                if exit_code_str:
+                    status.exit_code = int(exit_code_str)
+                    if status.exit_code != 0:
+                        status.state = JobState.FAILED
             if status.state == JobState.FAILED:
 
                 if status.message is None:
@@ -551,8 +571,44 @@ class BatchSchedulerExecutor(JobExecutor):
             assert job.native_id
             assert suffix
             path = self.work_directory / (job.native_id + suffix)
-        if force or path.exists():
+        try:
             path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _read_completion_record(self, native_id: str) -> Tuple[str, Optional[int]]:
+        """Reads a completion sidecar without consuming it.
+
+        The scheduler can purge a row before the shared filesystem has made the
+        sidecar visible.  A partial write is therefore pending evidence rather
+        than a successful completion.
+        """
+        path = self.work_directory / (native_id + '.ec')
+        try:
+            value = path.read_bytes().decode('ascii')
+        except FileNotFoundError:
+            return 'missing', None
+        except (OSError, UnicodeError):
+            return 'invalid', None
+        if _EXIT_CODE_RECORD.fullmatch(value) is None:
+            return 'invalid', None
+        return 'valid', int(value.strip())
+
+    def _read_completion_message(self, native_id: str) -> Optional[str]:
+        try:
+            return (self.work_directory / (native_id + '.out')).read_text(encoding='utf-8')
+        except (FileNotFoundError, OSError, UnicodeError):
+            return None
+
+    def _delete_completion_files(self, native_id: str) -> None:
+        assert isinstance(self.config, BatchSchedulerExecutorConfig)
+        if self.config.keep_files:
+            return
+        for suffix in ('.ec', '.out'):
+            try:
+                (self.work_directory / (native_id + suffix)).unlink()
+            except FileNotFoundError:
+                pass
 
     def list(self) -> List[str]:
         """Returns a list of jobs known to the underlying implementation.
@@ -573,33 +629,42 @@ class _QueuePollThread(Thread):
         self.name = name
         self.daemon = True
         self.config = config
-        self.executor = executor
+        self._done = Event()
+        self.executor = weakref.ref(executor, self._executor_collected)
         # native_id -> job
         self._jobs: Dict[str, List[Job]] = {}
+        self._missing_since: Dict[str, float] = {}
         # counts consecutive errors while invoking qstat or equivalent
         self._poll_error_count = 0
         self._jobs_lock = RLock()
 
     def run(self) -> None:
-        logger.debug('Executor %s: queue poll thread started', self.executor)
-        time.sleep(self.config.initial_queue_polling_delay)
-        while True:
+        logger.debug('Executor %s: queue poll thread started', self.executor())
+        if self._done.wait(self.config.initial_queue_polling_delay):
+            return
+        while not self._done.is_set():
             self._poll()
-            time.sleep(self.config.queue_polling_interval)
+            self._done.wait(self.config.queue_polling_interval)
+
+    def _executor_collected(self, executor: object) -> None:
+        self._done.set()
 
     def _poll(self) -> None:
+        executor = self.executor()
+        if executor is None:
+            return
         with self._jobs_lock:
             if len(self._jobs) == 0:
                 return
-            jobs_copy = dict(self._jobs)
+            jobs_copy = {native_id: list(jobs) for native_id, jobs in self._jobs.items()}
         logger.info('Polling for %s jobs', len(jobs_copy))
         try:
-            out = self.executor._run_command(self.executor.get_status_command(jobs_copy.keys()))
+            out = executor._run_command(executor.get_status_command(jobs_copy.keys()))
         except subprocess.CalledProcessError as ex:
             out = ex.output
             exit_code = ex.returncode
         except Exception as ex:
-            self._handle_poll_error(True,
+            self._handle_poll_error(executor, True,
                                     ex,
                                     f'Failed to poll for job status: {traceback.format_exc()}')
             return
@@ -608,36 +673,82 @@ class _QueuePollThread(Thread):
             self._poll_error_count = 0
         logger.debug('Output from status command: %s', out)
         try:
-            status_map = self.executor.parse_status_output(exit_code, out)
+            status_map = executor.parse_status_output(exit_code, out)
         except Exception as ex:
-            self._handle_poll_error(False,
+            self._handle_poll_error(executor, False,
                                     ex,
                                     f'Failed to poll for job status: {traceback.format_exc()}')
             return
         try:
             for native_id, job_list in jobs_copy.items():
                 try:
-                    status = self._get_job_status(native_id, status_map)
+                    status, completion_evidence_checked = self._get_job_status(
+                        executor, native_id, status_map)
                 except Exception:
                     status = JobStatus(JobState.FAILED,
                                        message='Failed to update job status: %s' %
                                                traceback.format_exc())
+                    completion_evidence_checked = False
+                if status is None:
+                    continue
                 for job in job_list:
-                    self.executor._set_job_status(job, status)
+                    job_status = JobStatus(status.state, time=status.time,
+                                           message=status.message,
+                                           exit_code=status.exit_code,
+                                           metadata=status.metadata)
+                    executor._set_job_status(job, job_status, completion_evidence_checked)
                 if status.state.final:
-                    with self._jobs_lock:
-                        del self._jobs[native_id]
+                    if self._remove_snapshot_jobs(native_id, job_list):
+                        executor._delete_completion_files(native_id)
         except Exception as ex:
             msg = traceback.format_exc()
-            self._handle_poll_error(True, ex, 'Error updating job statuses {}'.format(msg))
+            self._handle_poll_error(executor, True, ex,
+                                    'Error updating job statuses {}'.format(msg))
 
-    def _get_job_status(self, native_id: str, status_map: Dict[str, JobStatus]) -> JobStatus:
-        if native_id in status_map:
-            return status_map[native_id]
-        else:
-            return JobStatus(JobState.COMPLETED)
+    def _get_job_status(self, executor: BatchSchedulerExecutor, native_id: str,
+                        status_map: Dict[str, JobStatus]) -> Tuple[Optional[JobStatus], bool]:
+        scheduler_status = status_map.get(native_id)
+        if scheduler_status is not None:
+            self._missing_since.pop(native_id, None)
+            return scheduler_status, False
 
-    def _handle_poll_error(self, immediate: bool, ex: Exception, msg: str) -> None:
+        evidence_kind, exit_code = executor._read_completion_record(native_id)
+        if evidence_kind == 'valid':
+            self._missing_since.pop(native_id, None)
+            assert exit_code is not None
+            state = JobState.COMPLETED if exit_code == 0 else JobState.FAILED
+            message = scheduler_status.message if scheduler_status is not None else None
+            if state == JobState.FAILED and message is None:
+                message = executor._read_completion_message(native_id)
+            return JobStatus(state, message=message, exit_code=exit_code), True
+
+        now = time.monotonic()
+        missing_since = self._missing_since.setdefault(native_id, now)
+        if now - missing_since < self.config.completion_grace_period:
+            return None, False
+        self._missing_since.pop(native_id, None)
+        return JobStatus(
+            JobState.FAILED,
+            message=('Missing or invalid completion evidence for native job %s (%s)'
+                     % (native_id, evidence_kind)),
+        ), True
+
+    def _remove_snapshot_jobs(self, native_id: str, snapshot: List[Job]) -> bool:
+        """Removes only jobs that belonged to the completed poll snapshot."""
+        with self._jobs_lock:
+            current = self._jobs.get(native_id)
+            if current is None:
+                return True
+            snapshot_ids = {id(job) for job in snapshot}
+            remaining = [job for job in current if id(job) not in snapshot_ids]
+            if remaining:
+                self._jobs[native_id] = remaining
+                return False
+            del self._jobs[native_id]
+            return True
+
+    def _handle_poll_error(self, executor: BatchSchedulerExecutor,
+                           immediate: bool, ex: Exception, msg: str) -> None:
         logger.warning('Polling error: %s', msg)
         self._poll_error_count += 1
         if immediate or (self._poll_error_count > self.config.queue_polling_error_threshold):
@@ -652,9 +763,10 @@ class _QueuePollThread(Thread):
                 assert len(self._jobs) > 0
                 jobs_copy = dict(self._jobs)
                 self._jobs.clear()
+                self._missing_since.clear()
             for job_list in jobs_copy.values():
                 for job in job_list:
-                    self.executor._set_job_status(job, JobStatus(JobState.FAILED, message=msg))
+                    executor._set_job_status(job, JobStatus(JobState.FAILED, message=msg))
 
     def register_job(self, job: Job) -> None:
         assert job.native_id

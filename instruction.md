@@ -24,12 +24,14 @@ cd /workspace
 ./scripts/reproduce.sh
 ```
 
-The four independent probes currently fail. Depending on which probe runs,
+The five independent probes currently fail. Depending on which probe runs,
 you will see a serialization exception or recovered fields with the wrong
 types, missing/invalid scheduler directives, an
 `UnreachableStateException` for a job that has already advanced past the
 requested state, and a launcher completion marker classified as a launcher
-failure.
+failure. The recovery probe also shows a fork child whose local job cannot be
+reaped and a recovered batch job that is finalized before its exit evidence
+is safely published.
 
 The repository imports successfully and the basic health check already
 passes. This is a behavioral repair task, not a dependency-installation task.
@@ -150,12 +152,69 @@ When a local job executable exits non-zero after a valid launcher completion,
 the job remains `FAILED` with its real exit code, but it must not acquire a
 false launcher-failure message.
 
+### 5. Fork-safe local execution
+
+A controller may initialize a local executor before creating workers with the
+POSIX `fork` start method. Each child that subsequently creates a local
+executor and submits a job must use a live process-reaper thread created for
+that child, rather than the copied and no-longer-running parent thread. Two
+independent fork children must each complete `/bin/true` within five seconds.
+Do not globally disable reaping or make the reaper non-daemon.
+
+### 6. Recovered batch-job concurrency and lifetime
+
+An idle batch executor must be collectable after its last strong application
+reference is deleted. Its daemon queue-poll thread must not strongly retain
+the executor and must terminate promptly when the executor is collected.
+
+Polling takes a snapshot of the jobs registered for each native scheduler ID.
+If another `Job` attaches to the same native ID while that poll is in flight,
+a terminal result may remove only the `Job` objects in that snapshot. The late
+attachment and its completion files must remain available for a later poll;
+every attached job must receive its own monotonic terminal transition.
+
+### 7. Delayed and malformed completion evidence
+
+`BatchSchedulerExecutorConfig` accepts a
+`completion_grace_period` in seconds, defaulting to `2.0`. The value must be a
+positive, finite `int` or `float`; booleans and non-numeric values are invalid.
+Existing constructor calls remain compatible.
+
+When a native ID disappears from scheduler status output, do not infer
+success. Read `<work_directory>/<executor-name>/<native_id>.ec` without
+consuming it. A valid record consists exactly of an ASCII signed decimal
+integer followed by LF or CRLF (`^-?[0-9]+\r?\n$`). Exit code zero means
+`COMPLETED`; a non-zero value means `FAILED` and the real exit code is
+preserved.
+
+Missing, empty, partial, undecodable, or otherwise malformed evidence keeps
+the job's previous non-final state during its native-ID-specific grace period.
+If valid evidence appears during that period, finalize normally. If the grace
+period expires first, finalize as `FAILED`, leave `exit_code` as `None`, and
+include the native ID plus whether evidence was missing or invalid in the
+diagnostic. A non-final scheduler row that reappears clears the pending timer.
+A scheduler row that is still present retains its reported PSI/J status.
+
+### 8. Scheduler status diagnostics
+
+- Slurm status rows may contain reason text with spaces. Known failure reasons
+  retain their established mapping, while an unknown reason is preserved
+  verbatim as diagnostic text. Unknown states and structurally malformed rows
+  still raise a clear exception.
+- PBS Pro JSON may omit the optional `comment` member; its message is then
+  `None`.
+- LSF JSON may omit reason members. Select the value of the first non-empty
+  member in `EXIT_REASON`, `KILL_REASON`, `SUSPEND_REASON` order rather than a
+  field name or nonexistent key.
+
 ## Preserved behavior
 
 - Keep the PSI/J 0.9.0 public class names and `Export`/`Import` call signatures.
 - Do not invoke real scheduler commands and do not require scheduler daemons.
 - Do not change resource constraint validation, environment inheritance,
   callback transition reconstruction, or the meaning of final job states.
+- Keep queue polling daemonized and scheduler-free verification deterministic;
+  do not invoke real status commands from the probes or tests.
 - Keep the built-in multiple launcher's concurrent worker behavior. Each
   worker must remain bounded by the positive-seconds
   `PSIJ_MULTI_LAUNCH_TIMEOUT_SECONDS` override (default `1800`), and a worker

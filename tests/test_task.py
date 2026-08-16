@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import io
+import gc
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import random
 import re
@@ -10,9 +12,11 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import warnings
+import weakref
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Iterable, Tuple, Type
@@ -34,11 +38,101 @@ from psij import (  # noqa: E402
     InvalidJobException,
     ResourceSpecV1,
 )
-from psij.executors.batch.batch_scheduler_executor import BatchSchedulerExecutor  # noqa: E402
+from psij.executors.batch.batch_scheduler_executor import (  # noqa: E402
+    BatchSchedulerExecutor,
+    BatchSchedulerExecutorConfig,
+    _QueuePollThread,
+)
 from psij.executors.batch.lsf import LsfExecutorConfig, LsfJobExecutor  # noqa: E402
 from psij.executors.batch.pbspro import PBSProExecutorConfig, PBSProJobExecutor  # noqa: E402
 from psij.executors.batch.slurm import SlurmExecutorConfig, SlurmJobExecutor  # noqa: E402
 from psij.launchers.single import SingleLauncher  # noqa: E402
+
+
+def _run_local_job_after_fork(connection: object) -> None:
+    """Child entry point for the inherited-thread regression."""
+    try:
+        executor = JobExecutor.get_instance("local")
+        job = Job(JobSpec(executable="/bin/true", launcher="single"))
+        executor.submit(job)
+        status = job.wait(timeout=timedelta(seconds=2))
+        result = {
+            "pid": os.getpid(),
+            "state": None if status is None else status.state.name,
+            "exit_code": None if status is None else status.exit_code,
+            "reaper_alive": executor._reaper.is_alive(),
+        }
+        connection.send(result)  # type: ignore[attr-defined]
+    except BaseException as error:
+        connection.send({"error": repr(error), "pid": os.getpid()})  # type: ignore[attr-defined]
+    finally:
+        connection.close()  # type: ignore[attr-defined]
+
+
+class _OfflineRecoveryExecutor(BatchSchedulerExecutor):
+    """A scheduler-free executor that exposes deterministic polling barriers."""
+
+    _NAME_ = "offline-recovery"
+
+    def __init__(self, root: Path, *, completion_grace_period: float = 1.0,
+                 start_background: bool = False) -> None:
+        self.status_map: Dict[str, JobStatus] = {}
+        self.poll_started: threading.Event | None = None
+        self.poll_release: threading.Event | None = None
+        self._start_background = start_background
+        config = BatchSchedulerExecutorConfig(
+            work_directory=root,
+            queue_polling_interval=0.02,
+            initial_queue_polling_delay=0.0,
+            completion_grace_period=completion_grace_period,
+        )
+        super().__init__(config=config)
+
+    def _start_queue_poll_thread(self) -> _QueuePollThread:
+        poller = _QueuePollThread("offline recovery poller", self.config, self)
+        if self._start_background:
+            poller.start()
+        return poller
+
+    def _run_command(self, cmd: list[str]) -> str:
+        if self.poll_started is not None:
+            self.poll_started.set()
+        if self.poll_release is not None and not self.poll_release.wait(2):
+            raise RuntimeError("poll barrier timed out")
+        return ""
+
+    def generate_submit_script(self, job: Job, context: Dict[str, object],
+                               submit_file: object) -> None:
+        raise NotImplementedError()
+
+    def get_submit_command(self, job: Job, submit_file_path: Path) -> list[str]:
+        return ["offline-submit"]
+
+    def job_id_from_submit_output(self, out: str) -> str:
+        return out
+
+    def get_cancel_command(self, native_id: str) -> list[str]:
+        return ["offline-cancel", native_id]
+
+    def process_cancel_command_output(self, exit_code: int, out: str) -> None:
+        return None
+
+    def get_status_command(self, native_ids: Iterable[str]) -> list[str]:
+        return ["offline-status", *native_ids]
+
+    def parse_status_output(self, exit_code: int, out: str) -> Dict[str, JobStatus]:
+        if exit_code != 0:
+            raise RuntimeError(out)
+        return dict(self.status_map)
+
+
+def _register_recovered_job(executor: _OfflineRecoveryExecutor, native_id: str) -> Job:
+    job = Job(JobSpec(executable="/bin/true", launcher="single"))
+    job._native_id = native_id
+    job.executor = executor
+    job.status = JobStatus(JobState.ACTIVE)
+    executor._queue_poll_thread.register_job(job)
+    return job
 
 
 def token(prefix: str) -> str:
@@ -546,6 +640,239 @@ class PreservedBehaviorTests(unittest.TestCase):
                         os.kill(pid, 9)
                     except ProcessLookupError:
                         pass
+
+
+class RecoveryConcurrencyTests(unittest.TestCase):
+    def test_fork_children_use_live_process_local_reapers(self) -> None:
+        if "fork" not in multiprocessing.get_all_start_methods():
+            self.skipTest("POSIX fork start method is unavailable")
+
+        parent_executor = JobExecutor.get_instance("local")
+        self.assertTrue(parent_executor._reaper.is_alive())
+        context = multiprocessing.get_context("fork")
+        children: list[tuple[object, object, multiprocessing.Process]] = []
+        for _ in range(2):
+            parent_connection, child_connection = context.Pipe(duplex=False)
+            process = context.Process(
+                target=_run_local_job_after_fork,
+                args=(child_connection,),
+            )
+            process.start()
+            child_connection.close()
+            children.append((parent_connection, child_connection, process))
+
+        try:
+            results = []
+            for parent_connection, _child_connection, process in children:
+                self.assertTrue(parent_connection.poll(5),
+                                f"fork child {process.pid} did not report completion")
+                results.append(parent_connection.recv())
+            for (_parent_connection, _child_connection, process), result in zip(children, results):
+                process.join(5)
+                self.assertFalse(process.is_alive(), f"fork child {process.pid} did not exit")
+                self.assertEqual(process.exitcode, 0)
+                self.assertNotIn("error", result)
+                self.assertEqual(result["state"], "COMPLETED")
+                self.assertEqual(result["exit_code"], 0)
+                self.assertTrue(result["reaper_alive"])
+            self.assertEqual(len({result["pid"] for result in results}), 2)
+        finally:
+            for parent_connection, _child_connection, process in children:
+                parent_connection.close()
+                if process.is_alive():
+                    process.terminate()
+                process.join(2)
+
+    def test_idle_batch_executor_and_poller_are_collectable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-poller-gc-") as td:
+            executor = _OfflineRecoveryExecutor(Path(td), start_background=True)
+            poller = executor._queue_poll_thread
+            executor_reference = weakref.ref(executor)
+            del executor
+
+            deadline = time.monotonic() + 2
+            while executor_reference() is not None and time.monotonic() < deadline:
+                gc.collect()
+                time.sleep(0.01)
+            self.assertIsNone(executor_reference(), "poller retained its executor")
+            poller.join(1)
+            self.assertFalse(poller.is_alive(), "poller survived executor collection")
+
+    def test_delayed_completion_record_does_not_create_false_success(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-delayed-ec-") as td:
+            executor = _OfflineRecoveryExecutor(Path(td), completion_grace_period=1.0)
+            executor.work_directory.mkdir(parents=True)
+            native_id = token("native-")
+            job = _register_recovered_job(executor, native_id)
+            record = executor.work_directory / f"{native_id}.ec"
+
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.ACTIVE)
+            for contents in ("", "7"):
+                record.write_text(contents, encoding="ascii")
+                executor._queue_poll_thread._poll()
+                self.assertEqual(job.status.state, JobState.ACTIVE)
+                self.assertIsNone(job.status.exit_code)
+
+            record.write_bytes(b"7\r\n")
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.FAILED)
+            self.assertEqual(job.status.exit_code, 7)
+
+    def test_completion_record_uses_exact_byte_grammar(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-ec-grammar-") as td:
+            executor = _OfflineRecoveryExecutor(Path(td))
+            executor.work_directory.mkdir(parents=True)
+            native_id = token("native-")
+            record = executor.work_directory / f"{native_id}.ec"
+            cases: tuple[tuple[bytes, tuple[str, int | None]], ...] = (
+                (b"0\n", ("valid", 0)),
+                (b"-19\r\n", ("valid", -19)),
+                (b"+1\n", ("invalid", None)),
+                (b"1", ("invalid", None)),
+                (b"1\r", ("invalid", None)),
+                (b" 1\n", ("invalid", None)),
+                (b"1\n\n", ("invalid", None)),
+                (b"\xff\n", ("invalid", None)),
+            )
+            for contents, expected in cases:
+                with self.subTest(contents=contents):
+                    record.write_bytes(contents)
+                    self.assertEqual(executor._read_completion_record(native_id), expected)
+
+    def test_scheduler_reappearance_resets_missing_timer(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-reappeared-") as td:
+            executor = _OfflineRecoveryExecutor(Path(td), completion_grace_period=0.03)
+            executor.work_directory.mkdir(parents=True)
+            native_id = token("native-")
+            job = _register_recovered_job(executor, native_id)
+            executor._queue_poll_thread._missing_since[native_id] = time.monotonic() - 10
+            executor.status_map[native_id] = JobStatus(JobState.ACTIVE)
+
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.ACTIVE)
+            self.assertNotIn(native_id, executor._queue_poll_thread._missing_since)
+
+            executor.status_map.clear()
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.ACTIVE)
+            self.assertIn(native_id, executor._queue_poll_thread._missing_since)
+
+    def test_present_scheduler_terminal_state_is_not_delayed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-present-terminal-") as td:
+            executor = _OfflineRecoveryExecutor(Path(td))
+            executor.work_directory.mkdir(parents=True)
+            native_id = token("native-")
+            job = _register_recovered_job(executor, native_id)
+            executor.status_map[native_id] = JobStatus(JobState.COMPLETED)
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.COMPLETED)
+
+    def test_invalid_completion_evidence_fails_after_grace_without_exit_code(self) -> None:
+        cases: tuple[tuple[str, bytes | None, str], ...] = (
+            ("missing", None, "missing"),
+            ("partial", b"7", "invalid"),
+            ("trailing-junk", b"0\nextra", "invalid"),
+        )
+        for label, contents, evidence_kind in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(
+                    prefix=f"psij-{label}-") as td:
+                executor = _OfflineRecoveryExecutor(
+                    Path(td), completion_grace_period=0.03)
+                executor.work_directory.mkdir(parents=True)
+                native_id = token("native-")
+                job = _register_recovered_job(executor, native_id)
+                if contents is not None:
+                    (executor.work_directory / f"{native_id}.ec").write_bytes(contents)
+
+                executor._queue_poll_thread._poll()
+                self.assertEqual(job.status.state, JobState.ACTIVE)
+                time.sleep(0.05)
+                executor._queue_poll_thread._poll()
+                self.assertEqual(job.status.state, JobState.FAILED)
+                self.assertIsNone(job.status.exit_code)
+                self.assertIsNotNone(job.status.message)
+                assert job.status.message is not None
+                self.assertIn(native_id, job.status.message)
+                self.assertIn(evidence_kind, job.status.message)
+
+    def test_inflight_poll_preserves_same_id_late_attachment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-poll-race-") as td:
+            executor = _OfflineRecoveryExecutor(Path(td))
+            executor.work_directory.mkdir(parents=True)
+            native_id = token("native-")
+            (executor.work_directory / f"{native_id}.ec").write_text("0\n", encoding="ascii")
+            first = _register_recovered_job(executor, native_id)
+            executor.poll_started = threading.Event()
+            executor.poll_release = threading.Event()
+
+            poll = threading.Thread(target=executor._queue_poll_thread._poll)
+            poll.start()
+            self.assertTrue(executor.poll_started.wait(1), "poll did not reach barrier")
+            second = _register_recovered_job(executor, native_id)
+            executor.poll_release.set()
+            poll.join(2)
+            self.assertFalse(poll.is_alive(), "barrier-controlled poll did not return")
+
+            self.assertEqual(first.status.state, JobState.COMPLETED)
+            self.assertEqual(first.status.exit_code, 0)
+            self.assertEqual(second.status.state, JobState.ACTIVE)
+            self.assertTrue((executor.work_directory / f"{native_id}.ec").is_file())
+            self.assertEqual(executor._queue_poll_thread._jobs[native_id], [second])
+
+            executor.poll_started = None
+            executor.poll_release = None
+            executor._queue_poll_thread._poll()
+            self.assertEqual(second.status.state, JobState.COMPLETED)
+            self.assertEqual(second.status.exit_code, 0)
+            self.assertNotIn(native_id, executor._queue_poll_thread._jobs)
+            self.assertFalse((executor.work_directory / f"{native_id}.ec").exists())
+
+    def test_completion_grace_period_requires_positive_finite_number(self) -> None:
+        for value in (0, -0.01, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                BatchSchedulerExecutorConfig(completion_grace_period=value)
+        for value in (True, False, "2", None):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                BatchSchedulerExecutorConfig(completion_grace_period=value)  # type: ignore[arg-type]
+        config = BatchSchedulerExecutorConfig(completion_grace_period=0.125)
+        self.assertEqual(config.completion_grace_period, 0.125)
+        self.assertEqual(BatchSchedulerExecutorConfig().completion_grace_period, 2.0)
+
+
+class SchedulerStatusParsingTests(unittest.TestCase):
+    def test_slurm_preserves_spaced_and_unknown_failure_reason(self) -> None:
+        executor = object.__new__(SlurmJobExecutor)
+        native_id = token("slurm-")
+        reason = "Node telemetry unavailable near rack 17"
+        output = f"JOBID STATE REASON\n{native_id} F {reason}\n"
+        statuses = executor.parse_status_output(0, output)
+        self.assertEqual(statuses[native_id].state, JobState.FAILED)
+        self.assertEqual(statuses[native_id].message, reason)
+
+    def test_pbs_accepts_missing_optional_comment(self) -> None:
+        executor = object.__new__(PBSProJobExecutor)
+        native_id = token("pbs-")
+        output = json.dumps({"Jobs": {native_id: {"job_state": "R"}}})
+        statuses = executor.parse_status_output(0, output)
+        self.assertEqual(statuses[native_id].state, JobState.ACTIVE)
+        self.assertIsNone(statuses[native_id].message)
+
+    def test_lsf_uses_first_nonempty_real_reason_value(self) -> None:
+        executor = object.__new__(LsfJobExecutor)
+        native_id = token("lsf-")
+        reason = token("preempted-by-")
+        output = json.dumps({
+            "RECORDS": [{
+                "JOBID": native_id,
+                "STAT": "EXIT",
+                "EXIT_REASON": "",
+                "KILL_REASON": reason,
+            }]
+        })
+        statuses = executor.parse_status_output(0, output)
+        self.assertEqual(statuses[native_id].state, JobState.FAILED)
+        self.assertEqual(statuses[native_id].message, reason)
 
 
 def render_script(executor_type: Type[BatchSchedulerExecutor], config: object,

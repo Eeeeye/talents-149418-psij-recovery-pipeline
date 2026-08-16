@@ -120,8 +120,9 @@ class LsfJobExecutor(BatchSchedulerExecutor):
             state = self._STATE_MAP[entry["STAT"]]
             message = None
             for reason in ("EXIT_REASON", "KILL_REASON", "SUSPEND_REASON"):
-                if entry[reason]:
-                    message = entry["reason"]
+                value = entry.get(reason)
+                if value:
+                    message = str(value)
                     break
             status_map[entry["JOBID"]] = JobStatus(state, message=message)
         return status_map
