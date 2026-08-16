@@ -125,8 +125,13 @@ lsf.spool=y         -> #BSUB -spool "y"
 
 Custom keys and values vary during verification. Do not special-case the
 examples, and do not leak one scheduler's attributes into another scheduler's
-script. Scheduler-qualified keys match `[A-Za-z][A-Za-z0-9_-]*`; their values
-are non-empty printable strings without CR, LF, or double-quote characters.
+script. Any custom attribute containing a dot is scheduler-qualified. Its
+complete name must match
+`[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z][A-Za-z0-9_-]*`, and its value must be a
+non-empty printable string without CR, LF, or double-quote characters. Reject
+an invalid qualified name or value with `ValueError` or `TypeError` before
+emitting a submit script. A valid attribute for another scheduler is ignored,
+not leaked into the current scheduler's script.
 
 ### 3. Monotonic state waiting
 
@@ -205,12 +210,16 @@ A scheduler row that is still present retains its reported PSI/J status.
 - PBS Pro JSON may omit the optional `comment` member; its message is then
   `None`. The top-level document and `Jobs` member are objects; each job entry
   is an object with a string `job_state`, while optional `Exit_status` is an
-  integer and optional `comment` is a string or null.
+  integer and optional `comment` is a string or null. For native states that
+  map to `COMPLETED`, an absent or zero `Exit_status` remains `COMPLETED`, value
+  `265` maps to `CANCELED`, and every other non-zero value maps to `FAILED`.
+  An `Exit_status` on a non-final native state does not make it final.
 - LSF JSON may omit reason members. Select the value of the first non-empty
   member in `EXIT_REASON`, `KILL_REASON`, `SUSPEND_REASON` order rather than a
   field name or nonexistent key. The top-level document is an object whose
   `RECORDS` member is a list; non-error records contain string `JOBID` and
-  `STAT` members.
+  `STAT` members. A record containing an `ERROR` member is ignored and does
+  not create a status entry.
 
 All three status parsers reject a non-zero scheduler-command exit before
 parsing its payload. PBS Pro and LSF reject malformed JSON, wrong container

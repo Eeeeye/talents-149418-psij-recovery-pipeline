@@ -25,6 +25,8 @@ UNKNOWN_ERROR = 'PSIJ: Unknown error'
 logger = logging.getLogger(__name__)
 
 _EXIT_CODE_RECORD = re.compile(r'^-?[0-9]+\r?\n\Z')
+_QUALIFIED_ATTRIBUTE = re.compile(
+    r'^[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z][A-Za-z0-9_-]*$')
 
 
 def check_status_exit_code(command: str, exit_code: int, out: str) -> None:
@@ -42,6 +44,15 @@ def _attrs_to_mustache(job: Job) -> Dict[str, Union[object, List[Dict[str, objec
     r: Dict[str, Union[object, List[Dict[str, object]]]] = {}
 
     for k, v in job.spec.attributes._custom_attributes.items():
+        if not isinstance(k, str):
+            raise TypeError('Custom attribute names must be strings')
+        if '.' in k:
+            if _QUALIFIED_ATTRIBUTE.fullmatch(k) is None:
+                raise ValueError('Invalid scheduler-qualified custom attribute: %r' % k)
+            if not isinstance(v, str):
+                raise TypeError('Scheduler-qualified custom attribute values must be strings')
+            if not v or not v.isprintable() or '"' in v:
+                raise ValueError('Invalid scheduler-qualified custom attribute value for %s' % k)
         ks = k.split('.', maxsplit=1)
         if len(ks) == 2:
             if ks[0] not in r:

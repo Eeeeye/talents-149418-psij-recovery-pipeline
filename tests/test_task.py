@@ -971,6 +971,81 @@ class RecoveryConcurrencyTests(unittest.TestCase):
 
 
 class SchedulerStatusParsingTests(unittest.TestCase):
+    _SLURM_REASONS = {
+        "AssociationJobLimit": "The job's association has reached its maximum job count.",
+        "AssociationResourceLimit": "The job's association has reached some resource limit.",
+        "AssociationTimeLimit": "The job's association has reached its time limit.",
+        "BadConstraints": "The job's constraints can not be satisfied.",
+        "BeginTime": "The job's earliest start time has not yet been reached.",
+        "Cleaning": "The job is being requeued and still cleaning up from its previous execution.",
+        "Dependency": "This job is waiting for a dependent job to complete.",
+        "FrontEndDown": "No front end node is available to execute this job.",
+        "InactiveLimit": "The job reached the system InactiveLimit.",
+        "InvalidAccount": "The job's account is invalid.",
+        "InvalidQOS": "The job's QOS is invalid.",
+        "JobHeldAdmin": "The job is held by a system administrator.",
+        "JobHeldUser": "The job is held by the user.",
+        "JobLaunchFailure": (
+            "The job could not be launched.This may be due to a file system problem, "
+            "invalid program name, etc."
+        ),
+        "Licenses": "The job is waiting for a license.",
+        "NodeDown": "A node required by the job is down.",
+        "NonZeroExitCode": "The job terminated with a non-zero exit code.",
+        "PartitionDown": "The partition required by this job is in a DOWN state.",
+        "PartitionInactive": (
+            "The partition required by this job is in an Inactive state and not able to "
+            "start jobs."
+        ),
+        "PartitionNodeLimit": (
+            "The number of nodes required by this job is outside of its partition's current "
+            "limits. Can also indicate that required nodes are DOWN or DRAINED."
+        ),
+        "PartitionTimeLimit": (
+            "The job's time limit exceeds its partition's current time limit."
+        ),
+        "Priority": (
+            "One or more higher priority jobs exist for this partition or advanced reservation."
+        ),
+        "Prolog": "Its PrologSlurmctld program is still running.",
+        "QOSJobLimit": "The job's QOS has reached its maximum job count.",
+        "QOSResourceLimit": "The job's QOS has reached some resource limit.",
+        "QOSTimeLimit": "The job's QOS has reached its time limit.",
+        "ReqNodeNotAvail": (
+            "Some node specifically required by the job is not currently available. The node "
+            "may currently be in use, reserved for another job, in an advanced reservation, "
+            "DOWN, DRAINED, or not responding. Nodes which are DOWN, DRAINED, or not responding "
+            "will be identified as part of the job's \"reason\" field as \"UnavailableNodes\". "
+            "Such nodes will typically require the intervention of a system administrator to "
+            "make available."
+        ),
+        "Reservation": "The job is waiting its advanced reservation to become available.",
+        "Resources": "The job is waiting for resources to become available.",
+        "SystemFailure": "Failure of the Slurm system, a file system, the network, etc.",
+        "TimeLimit": "The job exhausted its time limit.",
+        "QOSUsageThreshold": "Required QOS threshold has been breached.",
+        "WaitingForScheduling": (
+            "No reason has been set for this job yet. Waiting for the scheduler to determine "
+            "the appropriate reason."
+        ),
+    }
+
+    def test_slurm_retains_every_established_failure_reason_mapping(self) -> None:
+        executor = object.__new__(SlurmJobExecutor)
+        rows = ["JOBID STATE REASON"]
+        native_ids = []
+        for index, reason in enumerate(self._SLURM_REASONS):
+            native_id = f"slurm-reason-{index}-{secrets.token_hex(3)}"
+            native_ids.append(native_id)
+            rows.append(f"{native_id} F {reason}")
+
+        statuses = executor.parse_status_output(0, "\n".join(rows) + "\n")
+        self.assertEqual(len(statuses), len(self._SLURM_REASONS))
+        for native_id, expected in zip(native_ids, self._SLURM_REASONS.values()):
+            with self.subTest(native_id=native_id):
+                self.assertEqual(statuses[native_id].state, JobState.FAILED)
+                self.assertEqual(statuses[native_id].message, expected)
+
     def test_slurm_preserves_spaced_and_unknown_failure_reason(self) -> None:
         executor = object.__new__(SlurmJobExecutor)
         native_id = token("slurm-")
@@ -1001,6 +1076,33 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         self.assertEqual(statuses[native_id].state, JobState.ACTIVE)
         self.assertIsNone(statuses[native_id].message)
 
+    def test_pbs_exit_status_and_cancellation_mapping_is_complete(self) -> None:
+        executor = object.__new__(PBSProJobExecutor)
+        missing = object()
+        for native_state in ("F", "X"):
+            for exit_status, expected in (
+                (missing, JobState.COMPLETED),
+                (0, JobState.COMPLETED),
+                (7, JobState.FAILED),
+                (265, JobState.CANCELED),
+            ):
+                native_id = token("pbs-final-")
+                report = {"job_state": native_state, "comment": native_id}
+                if exit_status is not missing:
+                    report["Exit_status"] = exit_status
+                output = json.dumps({"Jobs": {native_id: report}})
+                statuses = executor.parse_status_output(0, output)
+                with self.subTest(native_state=native_state, exit_status=exit_status):
+                    self.assertEqual(statuses[native_id].state, expected)
+                    self.assertEqual(statuses[native_id].message, native_id)
+
+        native_id = token("pbs-active-")
+        output = json.dumps({
+            "Jobs": {native_id: {"job_state": "R", "Exit_status": 265}}
+        })
+        self.assertEqual(executor.parse_status_output(0, output)[native_id].state,
+                         JobState.ACTIVE)
+
     def test_lsf_uses_first_nonempty_real_reason_value(self) -> None:
         executor = object.__new__(LsfJobExecutor)
         native_id = token("lsf-")
@@ -1016,6 +1118,20 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         statuses = executor.parse_status_output(0, output)
         self.assertEqual(statuses[native_id].state, JobState.FAILED)
         self.assertEqual(statuses[native_id].message, reason)
+
+    def test_lsf_error_records_are_ignored_without_hiding_valid_records(self) -> None:
+        executor = object.__new__(LsfJobExecutor)
+        native_id = token("lsf-valid-")
+        output = json.dumps({
+            "RECORDS": [
+                {"ERROR": token("lsf-error-")},
+                {"ERROR": "not found", "JOBID": 7, "STAT": 7},
+                {"JOBID": native_id, "STAT": "DONE"},
+            ]
+        })
+        statuses = executor.parse_status_output(0, output)
+        self.assertEqual(set(statuses), {native_id})
+        self.assertEqual(statuses[native_id].state, JobState.COMPLETED)
 
     def test_status_parsers_reject_nonzero_command_exits(self) -> None:
         cases = (
@@ -1175,6 +1291,24 @@ class BatchRenderingTests(unittest.TestCase):
             for other, value in values.items():
                 if other != scheduler:
                     self.assertNotIn(value, script)
+
+    def test_invalid_scheduler_custom_attribute_names_and_values_are_rejected(self) -> None:
+        cases = (
+            ({7: "value"}, TypeError),
+            ({".qos": "value"}, ValueError),
+            ({"slurm.": "value"}, ValueError),
+            ({"slurm.9qos": "value"}, ValueError),
+            ({"slurm.bad.key": "value"}, ValueError),
+            ({"slurm.bad key": "value"}, ValueError),
+            ({"slurm.qos": 7}, TypeError),
+            ({"slurm.qos": ""}, ValueError),
+            ({"slurm.qos": "line\nbreak"}, ValueError),
+            ({"slurm.qos": "tab\tvalue"}, ValueError),
+            ({"slurm.qos": 'bad"value'}, ValueError),
+        )
+        for custom, error_type in cases:
+            with self.subTest(custom=custom), self.assertRaises(error_type):
+                render_all(complete_spec(custom=custom))  # type: ignore[arg-type]
 
     def test_recovered_spec_drives_batch_script(self) -> None:
         duration = timedelta(days=1, hours=9, minutes=17, seconds=23)
