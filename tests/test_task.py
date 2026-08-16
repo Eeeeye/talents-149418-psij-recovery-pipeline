@@ -396,6 +396,42 @@ print(json.dumps({
         self.assertIsNone(restored.pre_launch)
         self.assertIsNone(restored.post_launch)
 
+    def test_legacy_missing_fields_use_new_jobspec_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "minimal-legacy.json"
+            path.write_text(
+                json.dumps({"version": 0.1, "type": "JobSpec", "data": {}}),
+                encoding="utf-8",
+            )
+            restored = Import().load(str(path))
+
+        self.assertIsInstance(restored, JobSpec)
+        assert isinstance(restored, JobSpec)
+        expected = JobSpec()
+        for field in (
+            "name",
+            "executable",
+            "arguments",
+            "directory",
+            "inherit_environment",
+            "environment",
+            "stdin_path",
+            "stdout_path",
+            "stderr_path",
+            "resources",
+            "pre_launch",
+            "post_launch",
+            "launcher",
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(getattr(restored, field), getattr(expected, field))
+        self.assertIsInstance(restored.attributes, JobAttributes)
+        self.assertEqual(restored.attributes.duration, expected.attributes.duration)
+        self.assertIsNone(restored.attributes.queue_name)
+        self.assertIsNone(restored.attributes.project_name)
+        self.assertIsNone(restored.attributes.reservation_id)
+        self.assertIsNone(restored.attributes._custom_attributes)
+
     def test_invalid_manifests_are_rejected(self) -> None:
         valid_data = {
             "name": "valid",
@@ -944,6 +980,19 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         self.assertEqual(statuses[native_id].state, JobState.FAILED)
         self.assertEqual(statuses[native_id].message, reason)
 
+    def test_slurm_rejects_unknown_states_and_malformed_structure(self) -> None:
+        executor = object.__new__(SlurmJobExecutor)
+        native_id = token("slurm-invalid-")
+        cases = (
+            ("", "Missing squeue status header"),
+            (f"{native_id} R None\n", "Malformed squeue status header"),
+            (f"JOBID STATE REASON\n{native_id} ZZ unknown state\n", "Unknown Slurm state"),
+            (f"JOBID STATE REASON\n{native_id} R\n", "Malformed squeue status row"),
+        )
+        for output, message in cases:
+            with self.subTest(output=output), self.assertRaisesRegex(ValueError, message):
+                executor.parse_status_output(0, output)
+
     def test_pbs_accepts_missing_optional_comment(self) -> None:
         executor = object.__new__(PBSProJobExecutor)
         native_id = token("pbs-")
@@ -967,6 +1016,52 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         statuses = executor.parse_status_output(0, output)
         self.assertEqual(statuses[native_id].state, JobState.FAILED)
         self.assertEqual(statuses[native_id].message, reason)
+
+    def test_status_parsers_reject_nonzero_command_exits(self) -> None:
+        cases = (
+            (object.__new__(SlurmJobExecutor), "squeue"),
+            (object.__new__(PBSProJobExecutor), "qstat"),
+            (object.__new__(LsfJobExecutor), "bjobs"),
+        )
+        for executor, command in cases:
+            with self.subTest(command=command), self.assertRaisesRegex(
+                    RuntimeError, command):
+                executor.parse_status_output(23, token("scheduler-error-"))
+
+    def test_json_status_parsers_reject_malformed_payloads(self) -> None:
+        pbs = object.__new__(PBSProJobExecutor)
+        lsf = object.__new__(LsfJobExecutor)
+        pbs_cases = (
+            "{truncated",
+            json.dumps([]),
+            json.dumps({}),
+            json.dumps({"Jobs": []}),
+            json.dumps({"Jobs": {"42.server": []}}),
+            json.dumps({"Jobs": {"42.server": {}}}),
+            json.dumps({"Jobs": {"42.server": {"job_state": "UNKNOWN"}}}),
+            json.dumps({"Jobs": {"42.server": {"job_state": "F", "Exit_status": "7"}}}),
+            json.dumps({"Jobs": {"42.server": {"job_state": "R", "Exit_status": None}}}),
+            json.dumps({"Jobs": {"42.server": {"job_state": "R", "comment": 7}}}),
+        )
+        lsf_cases = (
+            "{truncated",
+            json.dumps([]),
+            json.dumps({}),
+            json.dumps({"RECORDS": {}}),
+            json.dumps({"RECORDS": ["not-an-object"]}),
+            json.dumps({"RECORDS": [{"STAT": "RUN"}]}),
+            json.dumps({"RECORDS": [{"JOBID": "42"}]}),
+            json.dumps({"RECORDS": [{"JOBID": "42", "STAT": 7}]}),
+            json.dumps({"RECORDS": [{"JOBID": "42", "STAT": "UNKNOWN"}]}),
+        )
+        for scheduler, executor, payloads in (
+            ("pbs", pbs, pbs_cases),
+            ("lsf", lsf, lsf_cases),
+        ):
+            for payload in payloads:
+                with self.subTest(scheduler=scheduler, payload=payload), \
+                        self.assertRaises(ValueError):
+                    executor.parse_status_output(0, payload)
 
 
 def render_script(executor_type: Type[BatchSchedulerExecutor], config: object,

@@ -116,24 +116,42 @@ class PBSProJobExecutor(BatchSchedulerExecutor):
         check_status_exit_code(_QSTAT_COMMAND, exit_code, out)
         r = {}
 
-        report = json.loads(out)
-        jobs = report['Jobs']
-        for native_id in jobs:
-            job_report = jobs[native_id]
-            native_state = job_report["job_state"]
+        try:
+            report = json.loads(out)
+        except json.JSONDecodeError as error:
+            raise ValueError('Malformed qstat JSON') from error
+        if not isinstance(report, dict):
+            raise ValueError('qstat status document must be an object')
+        jobs = report.get('Jobs')
+        if not isinstance(jobs, dict):
+            raise ValueError('qstat Jobs must be an object')
+        for native_id, job_report in jobs.items():
+            if not isinstance(job_report, dict):
+                raise ValueError('qstat job entry must be an object')
+            native_state = job_report.get("job_state")
+            if not isinstance(native_state, str):
+                raise ValueError('qstat job_state must be a string')
             state = self._get_state(native_state)
 
+            exit_status = job_report.get('Exit_status')
+            if 'Exit_status' in job_report and (
+                    isinstance(exit_status, bool) or not isinstance(exit_status, int)):
+                raise ValueError('qstat Exit_status must be an integer')
             if state == JobState.COMPLETED:
-                if 'Exit_status' in job_report and job_report['Exit_status'] == 265:
+                if exit_status == 265:
                     state = JobState.CANCELED
-                elif 'Exit_status' in job_report and job_report['Exit_status'] != 0:
+                elif exit_status is not None and exit_status != 0:
                     state = JobState.FAILED
 
             msg = job_report.get("comment")
+            if msg is not None and not isinstance(msg, str):
+                raise ValueError('qstat comment must be a string or null')
             r[native_id] = JobStatus(state, message=msg)
 
         return r
 
     def _get_state(self, state: str) -> JobState:
-        assert state in _STATE_MAP, f"PBS state {state} is not known to PSI/J"
-        return _STATE_MAP[state]
+        try:
+            return _STATE_MAP[state]
+        except KeyError as error:
+            raise ValueError('Unknown PBS state: %s' % state) from error

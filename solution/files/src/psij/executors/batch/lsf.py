@@ -112,19 +112,38 @@ class LsfJobExecutor(BatchSchedulerExecutor):
         as any state-change reasons if present.
         """
         check_status_exit_code(_BJOBS_COMMAND, exit_code, out)
-        output = json.loads(out)
+        try:
+            output = json.loads(out)
+        except json.JSONDecodeError as error:
+            raise ValueError('Malformed bjobs JSON') from error
+        if not isinstance(output, dict):
+            raise ValueError('bjobs status document must be an object')
+        records = output.get("RECORDS")
+        if not isinstance(records, list):
+            raise ValueError('bjobs RECORDS must be a list')
         status_map = {}
-        for entry in output["RECORDS"]:
+        for entry in records:
+            if not isinstance(entry, dict):
+                raise ValueError('bjobs record must be an object')
             if "ERROR" in entry:
                 continue
-            state = self._STATE_MAP[entry["STAT"]]
+            native_id = entry.get("JOBID")
+            native_state = entry.get("STAT")
+            if not isinstance(native_id, str):
+                raise ValueError('bjobs JOBID must be a string')
+            if not isinstance(native_state, str):
+                raise ValueError('bjobs STAT must be a string')
+            try:
+                state = self._STATE_MAP[native_state]
+            except KeyError as error:
+                raise ValueError('Unknown LSF state: %s' % native_state) from error
             message = None
             for reason in ("EXIT_REASON", "KILL_REASON", "SUSPEND_REASON"):
                 value = entry.get(reason)
                 if value:
                     message = str(value)
                     break
-            status_map[entry["JOBID"]] = JobStatus(state, message=message)
+            status_map[native_id] = JobStatus(state, message=message)
         return status_map
 
     def job_id_from_submit_output(self, out: str) -> str:

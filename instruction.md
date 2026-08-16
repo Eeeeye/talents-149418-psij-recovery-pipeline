@@ -199,13 +199,22 @@ A scheduler row that is still present retains its reported PSI/J status.
 
 - Slurm status rows may contain reason text with spaces. Known failure reasons
   retain their established mapping, while an unknown reason is preserved
-  verbatim as diagnostic text. Unknown states and structurally malformed rows
-  still raise a clear exception.
+  verbatim as diagnostic text. Status output requires the three-column
+  `JOBID STATE REASON` header; unknown states, a missing or malformed header,
+  and structurally malformed rows raise `ValueError`.
 - PBS Pro JSON may omit the optional `comment` member; its message is then
-  `None`.
+  `None`. The top-level document and `Jobs` member are objects; each job entry
+  is an object with a string `job_state`, while optional `Exit_status` is an
+  integer and optional `comment` is a string or null.
 - LSF JSON may omit reason members. Select the value of the first non-empty
   member in `EXIT_REASON`, `KILL_REASON`, `SUSPEND_REASON` order rather than a
-  field name or nonexistent key.
+  field name or nonexistent key. The top-level document is an object whose
+  `RECORDS` member is a list; non-error records contain string `JOBID` and
+  `STAT` members.
+
+All three status parsers reject a non-zero scheduler-command exit before
+parsing its payload. PBS Pro and LSF reject malformed JSON, wrong container
+types, missing required members, and unknown native states with `ValueError`.
 
 ## Preserved behavior
 

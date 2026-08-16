@@ -147,10 +147,12 @@ class SlurmJobExecutor(BatchSchedulerExecutor):
         """See :meth:`~.BatchSchedulerExecutor.parse_status_output`."""
         check_status_exit_code(_SQUEUE_COMMAND, exit_code, out)
         r = {}
-        lines = iter(out.split('\n'))
-        # skip header
-        lines.__next__()
-        for line in lines:
+        rows = out.splitlines()
+        if not rows:
+            raise ValueError('Missing squeue status header')
+        if rows[0].split() != ['JOBID', 'STATE', 'REASON']:
+            raise ValueError('Malformed squeue status header: %r' % rows[0])
+        for line in rows[1:]:
             if not line:
                 continue
             cols = line.split(maxsplit=2)
