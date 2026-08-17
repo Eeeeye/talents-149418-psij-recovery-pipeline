@@ -9,7 +9,6 @@ import math
 import multiprocessing
 import os
 import pkgutil
-import random
 import re
 import secrets
 import subprocess
@@ -851,42 +850,67 @@ class RecoveryConcurrencyTests(unittest.TestCase):
 
     def test_completion_record_uses_exact_byte_grammar(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-ec-grammar-") as td:
-            executor = _OfflineRecoveryExecutor(Path(td))
-            executor.work_directory.mkdir(parents=True)
-            native_id = token("native-")
-            record = executor.work_directory / f"{native_id}.ec"
-            cases: tuple[tuple[bytes, tuple[str, int | None]], ...] = (
-                (b"0\n", ("valid", 0)),
-                (b"-19\r\n", ("valid", -19)),
-                (b"+1\n", ("invalid", None)),
-                (b"1", ("invalid", None)),
-                (b"1\r", ("invalid", None)),
-                (b" 1\n", ("invalid", None)),
-                (b"1\n\n", ("invalid", None)),
-                (b"\xff\n", ("invalid", None)),
+            cases: tuple[tuple[bytes, int | None], ...] = (
+                (b"0\n", 0),
+                (b"-19\r\n", -19),
+                (b"+1\n", None),
+                (b"1", None),
+                (b"1\r", None),
+                (b" 1\n", None),
+                (b"1\n\n", None),
+                (b"\xff\n", None),
             )
-            for contents, expected in cases:
+            for contents, expected_exit_code in cases:
                 with self.subTest(contents=contents):
+                    executor = _OfflineRecoveryExecutor(
+                        Path(td), completion_grace_period=0.03)
+                    executor.work_directory.mkdir(parents=True, exist_ok=True)
+                    native_id = token("native-")
+                    job = _register_recovered_job(executor, native_id)
+                    record = executor.work_directory / f"{native_id}.ec"
                     record.write_bytes(contents)
-                    self.assertEqual(executor._read_completion_record(native_id), expected)
+                    executor._queue_poll_thread._poll()
+
+                    if expected_exit_code is not None:
+                        expected_state = (JobState.COMPLETED if expected_exit_code == 0
+                                          else JobState.FAILED)
+                        self.assertEqual(job.status.state, expected_state)
+                        self.assertEqual(job.status.exit_code, expected_exit_code)
+                    else:
+                        self.assertEqual(job.status.state, JobState.ACTIVE)
+                        self.assertIsNone(job.status.exit_code)
+                        time.sleep(0.05)
+                        executor._queue_poll_thread._poll()
+                        self.assertEqual(job.status.state, JobState.FAILED)
+                        self.assertIsNone(job.status.exit_code)
 
     def test_scheduler_reappearance_resets_missing_timer(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-reappeared-") as td:
-            executor = _OfflineRecoveryExecutor(Path(td), completion_grace_period=0.03)
+            grace_period = 0.12
+            executor = _OfflineRecoveryExecutor(
+                Path(td), completion_grace_period=grace_period)
             executor.work_directory.mkdir(parents=True)
             native_id = token("native-")
             job = _register_recovered_job(executor, native_id)
-            executor._queue_poll_thread._missing_since[native_id] = time.monotonic() - 10
-            executor.status_map[native_id] = JobStatus(JobState.ACTIVE)
 
             executor._queue_poll_thread._poll()
             self.assertEqual(job.status.state, JobState.ACTIVE)
-            self.assertNotIn(native_id, executor._queue_poll_thread._missing_since)
 
+            time.sleep(grace_period / 2)
+            executor.status_map[native_id] = JobStatus(JobState.ACTIVE)
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.ACTIVE)
+
+            time.sleep(grace_period * 0.75)
             executor.status_map.clear()
             executor._queue_poll_thread._poll()
             self.assertEqual(job.status.state, JobState.ACTIVE)
-            self.assertIn(native_id, executor._queue_poll_thread._missing_since)
+            self.assertIsNone(job.status.exit_code)
+
+            time.sleep(grace_period * 1.25)
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.FAILED)
+            self.assertIsNone(job.status.exit_code)
 
     def test_present_scheduler_terminal_state_is_not_delayed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-present-terminal-") as td:
@@ -1231,33 +1255,31 @@ def parse_hms(value: str, allow_days: bool) -> int:
 
 class BatchRenderingTests(unittest.TestCase):
     def test_walltimes_preserve_duration_in_each_scheduler_dialect(self) -> None:
-        rng = random.SystemRandom()
-        for _ in range(4):
-            duration = timedelta(
-                days=rng.randint(0, 4),
-                hours=rng.randint(0, 23),
-                minutes=rng.randint(0, 59),
-                seconds=rng.randint(0, 59),
-                microseconds=rng.randint(0, 999999),
-            )
-            if duration == timedelta(0):
-                duration = timedelta(seconds=1)
-            scripts = render_all(complete_spec(duration=duration, custom={}))
-            expected_seconds = math.ceil(duration.total_seconds())
+        durations = (
+            timedelta(seconds=1),
+            timedelta(seconds=59, microseconds=1),
+            timedelta(hours=1, seconds=1),
+            timedelta(days=1, hours=2, minutes=3, seconds=4, microseconds=1),
+            timedelta(days=4, hours=23, minutes=59, seconds=59, microseconds=999999),
+        )
+        for duration in durations:
+            with self.subTest(duration=duration):
+                scripts = render_all(complete_spec(duration=duration, custom={}))
+                expected_seconds = math.ceil(duration.total_seconds())
 
-            slurm = directive_value(scripts["slurm"], r"^#SBATCH --time=([^\s]+)$")
-            self.assertEqual(parse_hms(slurm, allow_days=True), expected_seconds)
+                slurm = directive_value(scripts["slurm"], r"^#SBATCH --time=([^\s]+)$")
+                self.assertEqual(parse_hms(slurm, allow_days=True), expected_seconds)
 
-            pbs = directive_value(scripts["pbs"], r"^#PBS -l walltime=([^\s]+)$")
-            self.assertEqual(parse_hms(pbs, allow_days=False), expected_seconds)
+                pbs = directive_value(scripts["pbs"], r"^#PBS -l walltime=([^\s]+)$")
+                self.assertEqual(parse_hms(pbs, allow_days=False), expected_seconds)
 
-            lsf = directive_value(scripts["lsf"], r"^#BSUB -W ([^\s]+)$")
-            pieces = lsf.split(":")
-            self.assertEqual(len(pieces), 2)
-            hours, minutes = (int(piece) for piece in pieces)
-            self.assertGreaterEqual(hours, 0)
-            self.assertTrue(0 <= minutes <= 59)
-            self.assertEqual(hours * 60 + minutes, math.ceil(expected_seconds / 60))
+                lsf = directive_value(scripts["lsf"], r"^#BSUB -W ([^\s]+)$")
+                pieces = lsf.split(":")
+                self.assertEqual(len(pieces), 2)
+                hours, minutes = (int(piece) for piece in pieces)
+                self.assertGreaterEqual(hours, 0)
+                self.assertTrue(0 <= minutes <= 59)
+                self.assertEqual(hours * 60 + minutes, math.ceil(expected_seconds / 60))
 
     def test_builtins_and_random_custom_attributes_render_without_cross_leakage(self) -> None:
         suffix = secrets.token_hex(5)
