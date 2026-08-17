@@ -200,6 +200,25 @@ def complete_spec(*, duration: timedelta | None = None,
     )
 
 
+def minimal_manifest_data() -> Dict[str, object]:
+    return {
+        "name": "valid",
+        "executable": "/bin/true",
+        "arguments": [],
+        "directory": None,
+        "inherit_environment": True,
+        "environment": {},
+        "stdin_path": None,
+        "stdout_path": None,
+        "stderr_path": None,
+        "resources": None,
+        "attributes": None,
+        "pre_launch": None,
+        "post_launch": None,
+        "launcher": None,
+    }
+
+
 def assert_specs_equal(test: unittest.TestCase, expected: JobSpec, actual: JobSpec) -> None:
     for field in (
         "name",
@@ -278,6 +297,53 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(restored.attributes._custom_attributes, original.attributes._custom_attributes)
         self.assertIs(restored.attributes._custom_attributes["slurm.extra"]["flag"], True)
         self.assertIsNone(restored.attributes._custom_attributes["slurm.extra"]["unset"])
+
+    def test_nested_non_finite_custom_attributes_fail_export_atomically(self) -> None:
+        invalid_values = {
+            "nan-in-list": {"outer": [1, {"value": float("nan")}]},
+            "positive-in-object": {"outer": {"value": float("inf")}},
+            "negative-in-list-object": {"outer": [{"value": float("-inf")}]},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "existing.json"
+            for label, invalid in invalid_values.items():
+                with self.subTest(label=label):
+                    sentinel = secrets.token_bytes(96)
+                    path.write_bytes(sentinel)
+                    spec = complete_spec(custom={"payload": invalid})
+                    with self.assertRaises((TypeError, ValueError)):
+                        Export().export(spec, str(path))
+                    self.assertEqual(path.read_bytes(), sentinel)
+                    self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_nested_non_finite_custom_attributes_are_rejected_on_import(self) -> None:
+        invalid_values = {
+            "nan-in-list": {"outer": [1, {"value": float("nan")}]},
+            "positive-in-object": {"outer": {"value": float("inf")}},
+            "negative-in-list-object": {"outer": [{"value": float("-inf")}]},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "non-finite.json"
+            for label, invalid in invalid_values.items():
+                with self.subTest(label=label):
+                    data = minimal_manifest_data()
+                    data["attributes"] = {
+                        "duration": "0:10:00",
+                        "queue_name": None,
+                        "project_name": None,
+                        "reservation_id": None,
+                        "custom_attributes": {"payload": invalid},
+                    }
+                    document = {
+                        "version": 0.1,
+                        "type": "JobSpec",
+                        "data": data,
+                    }
+                    encoded = json.dumps(document)
+                    self.assertRegex(encoded, r"(?:NaN|-?Infinity)")
+                    path.write_text(encoded, encoding="utf-8")
+                    with self.assertRaises((TypeError, ValueError)):
+                        Import().load(str(path))
 
     def test_repeated_export_publishes_the_latest_complete_spec(self) -> None:
         first = complete_spec(duration=timedelta(hours=1))
@@ -432,20 +498,7 @@ print(json.dumps({
         self.assertIsNone(restored.attributes._custom_attributes)
 
     def test_invalid_manifests_are_rejected(self) -> None:
-        valid_data = {
-            "name": "valid",
-            "executable": "/bin/true",
-            "arguments": [],
-            "directory": None,
-            "inherit_environment": True,
-            "environment": {},
-            "stdin_path": None,
-            "stdout_path": None,
-            "stderr_path": None,
-            "resources": None,
-            "attributes": None,
-            "launcher": None,
-        }
+        valid_data = minimal_manifest_data()
         invalid_documents = [
             {"version": 99, "type": "JobSpec", "data": valid_data},
             {"version": 0.1, "type": "Other", "data": valid_data},
@@ -480,6 +533,60 @@ print(json.dumps({
                 path.write_text(json.dumps(document), encoding="utf-8")
                 with self.subTest(index=index), self.assertRaises((ValueError, TypeError)):
                     Import().load(str(path))
+
+    def test_invalid_envelope_shapes_and_field_types_are_rejected(self) -> None:
+        valid_data = minimal_manifest_data()
+        invalid_documents = {
+            "array-envelope": [],
+            "null-envelope": None,
+            "missing-version": {"type": "JobSpec", "data": valid_data},
+            "boolean-version": {"version": True, "type": "JobSpec", "data": valid_data},
+            "string-version": {"version": "0.1", "type": "JobSpec", "data": valid_data},
+            "null-type": {"version": 0.1, "type": None, "data": valid_data},
+            "numeric-type": {"version": 0.1, "type": 1, "data": valid_data},
+            "missing-data": {"version": 0.1, "type": "JobSpec"},
+            "null-data": {"version": 0.1, "type": "JobSpec", "data": None},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "invalid-envelope.json"
+            for label, document in invalid_documents.items():
+                with self.subTest(label=label):
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaises((TypeError, ValueError)):
+                        Import().load(str(path))
+
+    def test_malformed_jobspec_field_shapes_and_conflicts_are_rejected(self) -> None:
+        malformed_fields = {
+            "arguments-not-list": {"arguments": "--not-a-list"},
+            "environment-not-object": {"environment": []},
+            "environment-value-not-string": {"environment": {"COUNT": 3}},
+            "inherit-environment-not-boolean": {"inherit_environment": 1},
+            "directory-not-string": {"directory": 7},
+            "resources-not-object": {"resources": []},
+            "conflicting-ppn-keys": {
+                "resources": {"process_per_node": 2, "processes_per_node": 3},
+            },
+            "attributes-not-object": {"attributes": []},
+            "custom-attributes-not-object": {
+                "attributes": {"custom_attributes": ["not", "an", "object"]},
+            },
+            "duration-minute-out-of-range": {
+                "attributes": {"duration": "0:60:00", "custom_attributes": {}},
+            },
+            "duration-second-out-of-range": {
+                "attributes": {"duration": "0:00:60", "custom_attributes": {}},
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "invalid-jobspec.json"
+            for label, fields in malformed_fields.items():
+                with self.subTest(label=label):
+                    data = minimal_manifest_data()
+                    data.update(fields)
+                    document = {"version": 0.1, "type": "JobSpec", "data": data}
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaises((TypeError, ValueError)):
+                        Import().load(str(path))
 
     def test_failed_export_does_not_replace_existing_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -986,11 +1093,13 @@ class RecoveryConcurrencyTests(unittest.TestCase):
         for value in (0, -0.01, float("nan"), float("inf"), float("-inf")):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 BatchSchedulerExecutorConfig(completion_grace_period=value)
-        for value in (True, False, "2", None):
+        for value in (True, False, "2", None, [2], {"seconds": 2}, object()):
             with self.subTest(value=value), self.assertRaises(TypeError):
                 BatchSchedulerExecutorConfig(completion_grace_period=value)  # type: ignore[arg-type]
-        config = BatchSchedulerExecutorConfig(completion_grace_period=0.125)
-        self.assertEqual(config.completion_grace_period, 0.125)
+        for value in (1, 0.125, 1_000_000.5):
+            with self.subTest(value=value):
+                config = BatchSchedulerExecutorConfig(completion_grace_period=value)
+                self.assertEqual(config.completion_grace_period, float(value))
         self.assertEqual(BatchSchedulerExecutorConfig().completion_grace_period, 2.0)
 
 
