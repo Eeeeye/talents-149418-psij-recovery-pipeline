@@ -2,13 +2,10 @@
 import io
 import gc
 import hashlib
-import importlib.util
 import json
-import logging
 import math
 import multiprocessing
 import os
-import pkgutil
 import re
 import secrets
 import subprocess
@@ -16,14 +13,12 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
 import warnings
 import weakref
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Iterable, Tuple, Type
-from unittest import mock
 
 
 ROOT = Path("/workspace")
@@ -64,7 +59,6 @@ def _run_local_job_after_fork(connection: object) -> None:
             "pid": os.getpid(),
             "state": None if status is None else status.state.name,
             "exit_code": None if status is None else status.exit_code,
-            "reaper_alive": executor._reaper.is_alive(),
         }
         connection.send(result)  # type: ignore[attr-defined]
     except BaseException as error:
@@ -141,15 +135,6 @@ def _register_recovered_job(executor: _OfflineRecoveryExecutor, native_id: str) 
 
 def token(prefix: str) -> str:
     return prefix + secrets.token_hex(6)
-
-
-def process_is_running(pid: int) -> bool:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return False
-    fields_after_name = stat.rsplit(")", 1)[1].split()
-    return bool(fields_after_name) and fields_after_name[0] != "Z"
 
 
 def complete_spec(*, duration: timedelta | None = None,
@@ -623,95 +608,6 @@ class ModificationBoundaryTests(unittest.TestCase):
 
 
 class PreservedBehaviorTests(unittest.TestCase):
-    def test_plugin_discovery_debug_logging_survives_a_missing_descriptor(self) -> None:
-        import psij
-
-        class MissingModuleFinder:
-            def find_spec(self, name: str, path: object = None) -> None:
-                return None
-
-        plugin_path = f"/tmp/{token('plugins-')}/psij-descriptors"
-        module = pkgutil.ModuleInfo(
-            MissingModuleFinder(), token("missing_descriptor_"), False
-        )
-        with self.assertLogs(psij.logger, level=logging.DEBUG) as captured:
-            psij._load_plugins("/tmp/plugin-root", plugin_path, module)
-        diagnostics = "\n".join(captured.output)
-        self.assertIn(plugin_path, diagnostics)
-        self.assertIn(module.name, diagnostics)
-
-    def test_flux_stderr_path_is_assigned_to_the_submitted_jobspec(self) -> None:
-        class FakeFluxJobspec:
-            created: "FakeFluxJobspec | None" = None
-
-            def __init__(self) -> None:
-                self.stdin: Path | None = None
-                self.stdout: Path | None = None
-                self.stderr: Path | None = None
-                self.duration: float | None = None
-
-            @classmethod
-            def from_command(cls, argv: list[str], **kwargs: object) -> "FakeFluxJobspec":
-                cls.created = cls()
-                return cls.created
-
-        class FakeFluxExecutorFuture:
-            pass
-
-        flux_module = types.ModuleType("flux")
-        flux_job_module = types.ModuleType("flux.job")
-        flux_job_module.FluxExecutorFuture = FakeFluxExecutorFuture  # type: ignore[attr-defined]
-        flux_job_module.JobspecV1 = FakeFluxJobspec  # type: ignore[attr-defined]
-        flux_module.job = flux_job_module  # type: ignore[attr-defined]
-
-        module_name = token("psij_flux_regression_")
-        source = ROOT / "src/psij/executors/flux.py"
-        module_spec = importlib.util.spec_from_file_location(module_name, source)
-        self.assertIsNotNone(module_spec)
-        assert module_spec is not None and module_spec.loader is not None
-        flux_executor_module = importlib.util.module_from_spec(module_spec)
-        with mock.patch.dict(
-            sys.modules, {"flux": flux_module, "flux.job": flux_job_module}
-        ):
-            module_spec.loader.exec_module(flux_executor_module)
-
-        submitted: list[FakeFluxJobspec] = []
-
-        class RecordingExecutor:
-            def submit(self, jobspec: FakeFluxJobspec) -> object:
-                submitted.append(jobspec)
-                return object()
-
-        executor = object.__new__(flux_executor_module.FluxJobExecutor)
-        executor._flux_executor = RecordingExecutor()
-        executor._check_job = lambda job: job.spec
-        executor._add_flux_callbacks = lambda job, future: None
-
-        stdin_path = Path(f"/tmp/{token('flux-stdin-')}.txt")
-        stdout_path = Path(f"/tmp/{token('flux-stdout-')}.log")
-        stderr_path = Path(f"/tmp/{token('flux-stderr-')}.log")
-        job = Job(JobSpec(
-            executable="/bin/echo",
-            arguments=["offline"],
-            stdin_path=stdin_path,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            resources=ResourceSpecV1(
-                process_count=1,
-                cpu_cores_per_process=1,
-                exclusive_node_use=False,
-            ),
-            attributes=JobAttributes(duration=timedelta(seconds=17)),
-        ))
-        executor.submit(job)
-
-        self.assertEqual(len(submitted), 1)
-        self.assertIs(submitted[0], FakeFluxJobspec.created)
-        self.assertEqual(submitted[0].stdin, stdin_path)
-        self.assertEqual(submitted[0].stdout, stdout_path)
-        self.assertEqual(submitted[0].stderr, stderr_path)
-        self.assertEqual(submitted[0].duration, 17.0)
-
     def test_resource_constraint_validation_is_unchanged(self) -> None:
         with self.assertRaises(InvalidJobException):
             ResourceSpecV1(node_count=2, process_count=5, processes_per_node=2)
@@ -748,143 +644,12 @@ class PreservedBehaviorTests(unittest.TestCase):
             self.assertIn(f"ONLY_TEST_VALUE={marker}", output)
             self.assertNotIn("PYTHONPATH=", output)
 
-    def test_multiple_launcher_bounds_and_reaps_worker_descendants(self) -> None:
-        launcher = ROOT / "src/psij/launchers/scripts/multi_launch.sh"
-        with tempfile.TemporaryDirectory(prefix="psij-multi-timeout-") as td:
-            root = Path(td)
-            pid_dir = root / "pids"
-            pid_dir.mkdir()
-            env = os.environ.copy()
-            env["PSIJ_MULTI_LAUNCH_TIMEOUT_SECONDS"] = "1"
-            env["PSIJ_TEST_PID_DIR"] = str(pid_dir)
-            child = (
-                "import os, pathlib, subprocess; "
-                "process = subprocess.Popen(['sleep', '30']); "
-                "pathlib.Path(os.environ['PSIJ_TEST_PID_DIR'], "
-                "os.environ['_PSI_J_PROCESS_INDEX_'] + '.pid').write_text(str(process.pid)); "
-                "process.wait()"
-            )
-            command = [
-                "/bin/bash",
-                str(launcher),
-                "timeout-test",
-                str(root / "launcher.log"),
-                "",
-                "",
-                "/dev/null",
-                str(root / "stdout.log"),
-                str(root / "stderr.log"),
-                "2",
-                sys.executable,
-                "-c",
-                child,
-            ]
-            started = time.monotonic()
-            result = subprocess.run(
-                command,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
-            )
-            elapsed = time.monotonic() - started
-            worker_pids = [int(path.read_text()) for path in sorted(pid_dir.glob("*.pid"))]
-            try:
-                self.assertEqual(len(worker_pids), 2)
-                self.assertEqual(result.returncode, 124, result.stderr)
-                self.assertLess(elapsed, 4.5)
-                self.assertEqual(result.stdout, "_PSI_J_LAUNCHER_DONE\n")
-                for _ in range(20):
-                    if all(not process_is_running(pid) for pid in worker_pids):
-                        break
-                    time.sleep(0.05)
-                for pid in worker_pids:
-                    self.assertFalse(process_is_running(pid),
-                                     f"timed-out worker descendant survived: {pid}")
-            finally:
-                for pid in worker_pids:
-                    try:
-                        os.kill(pid, 9)
-                    except ProcessLookupError:
-                        pass
-
-    def test_multiple_launcher_interrupt_cleans_worker_descendants(self) -> None:
-        launcher = ROOT / "src/psij/launchers/scripts/multi_launch.sh"
-        with tempfile.TemporaryDirectory(prefix="psij-multi-signal-") as td:
-            root = Path(td)
-            pid_dir = root / "pids"
-            pid_dir.mkdir()
-            env = os.environ.copy()
-            env["PSIJ_MULTI_LAUNCH_TIMEOUT_SECONDS"] = "30"
-            env["PSIJ_TEST_PID_DIR"] = str(pid_dir)
-            child = (
-                "import os, pathlib, subprocess; "
-                "process = subprocess.Popen(['sleep', '30']); "
-                "pathlib.Path(os.environ['PSIJ_TEST_PID_DIR'], "
-                "os.environ['_PSI_J_PROCESS_INDEX_'] + '.pid').write_text(str(process.pid)); "
-                "process.wait()"
-            )
-            command = [
-                "/bin/bash",
-                str(launcher),
-                "signal-test",
-                str(root / "launcher.log"),
-                "",
-                "",
-                "/dev/null",
-                str(root / "stdout.log"),
-                str(root / "stderr.log"),
-                "2",
-                sys.executable,
-                "-c",
-                child,
-            ]
-            process = subprocess.Popen(
-                command,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            worker_pids: list[int] = []
-            try:
-                deadline = time.monotonic() + 3
-                while time.monotonic() < deadline:
-                    paths = sorted(pid_dir.glob("*.pid"))
-                    if len(paths) == 2:
-                        worker_pids = [int(path.read_text()) for path in paths]
-                        break
-                    time.sleep(0.05)
-                self.assertEqual(len(worker_pids), 2)
-                process.terminate()
-                process.communicate(timeout=5)
-                self.assertEqual(process.returncode, 143)
-                for _ in range(20):
-                    if all(not process_is_running(pid) for pid in worker_pids):
-                        break
-                    time.sleep(0.05)
-                for pid in worker_pids:
-                    self.assertFalse(process_is_running(pid),
-                                     f"interrupted worker descendant survived: {pid}")
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.communicate()
-                for pid in worker_pids:
-                    try:
-                        os.kill(pid, 9)
-                    except ProcessLookupError:
-                        pass
-
-
 class RecoveryConcurrencyTests(unittest.TestCase):
-    def test_fork_children_use_live_process_local_reapers(self) -> None:
+    def test_fork_children_complete_process_local_jobs(self) -> None:
         if "fork" not in multiprocessing.get_all_start_methods():
             self.skipTest("POSIX fork start method is unavailable")
 
-        parent_executor = JobExecutor.get_instance("local")
-        self.assertTrue(parent_executor._reaper.is_alive())
+        JobExecutor.get_instance("local")
         context = multiprocessing.get_context("fork")
         children: list[tuple[object, object, multiprocessing.Process]] = []
         for _ in range(2):
@@ -910,7 +675,6 @@ class RecoveryConcurrencyTests(unittest.TestCase):
                 self.assertNotIn("error", result)
                 self.assertEqual(result["state"], "COMPLETED")
                 self.assertEqual(result["exit_code"], 0)
-                self.assertTrue(result["reaper_alive"])
             self.assertEqual(len({result["pid"] for result in results}), 2)
         finally:
             for parent_connection, _child_connection, process in children:

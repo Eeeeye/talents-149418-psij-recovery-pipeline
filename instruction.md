@@ -77,14 +77,22 @@ custom-attribute value, including inside a nested list or object. Reject those
 values during both export and import rather than accepting Python's
 non-standard JSON extensions.
 
-The on-disk document remains a JSON envelope with numeric `version`, string
-`type`, and object `data` members. `Import.load()` must continue to read
-version `0.1`, type `JobSpec` manifests such as
-`examples/legacy-job-v0.1.json`. In a legacy resource object, the historical
-key `process_per_node` means `processes_per_node`. A legacy duration is the
-canonical text produced by `str(datetime.timedelta(...))`; it must be restored
-as a `timedelta`. Fields absent from an old manifest default to the same value
-as a newly constructed `JobSpec`.
+The on-disk document remains a JSON envelope with required `version`, `type`,
+and `data` members. Their JSON kinds are exact: `version` is a number (a JSON
+boolean is not a number here), `type` is a string, and `data` is an object.
+`Import.load()` must continue to read version `0.1`, type `JobSpec` manifests
+such as `examples/legacy-job-v0.1.json`.
+
+Within `data`, `arguments` is an array or null; `inherit_environment` is a
+boolean; `environment` is an object with string keys and values or null; path
+members are strings or null; and `resources` and `attributes` are objects or
+null. `attributes.custom_attributes` is an object or null. A legacy resource
+object may use `process_per_node` to mean `processes_per_node`; if both names
+are present with different values, the manifest is invalid. A legacy duration
+is the canonical text produced by `str(datetime.timedelta(...))`, with hour,
+minute, and second components in `00..23`, `00..59`, and `00..59`; it must be
+restored as a `timedelta`. Fields absent from an old manifest default to the
+same value as a newly constructed `JobSpec`.
 
 Reject malformed JSON, unsupported envelope versions or types, non-object
 `data`, unknown resource-spec versions, and malformed durations with a clear
@@ -166,11 +174,10 @@ false launcher-failure message.
 ### 5. Fork-safe local execution
 
 A controller may initialize a local executor before creating workers with the
-POSIX `fork` start method. Each child that subsequently creates a local
-executor and submits a job must use a live process-reaper thread created for
-that child, rather than the copied and no-longer-running parent thread. Two
-independent fork children must each complete `/bin/true` within five seconds.
-Do not globally disable reaping or make the reaper non-daemon.
+POSIX `fork` start method. Two independent fork children must each obtain a
+local executor, submit `/bin/true`, observe `COMPLETED` with exit code zero,
+and exit within five seconds. Copied parent-process runtime state must not make
+either child hang or lose completion.
 
 ### 6. Recovered batch-job concurrency and lifetime
 
@@ -189,7 +196,8 @@ every attached job must receive its own monotonic terminal transition.
 `BatchSchedulerExecutorConfig` accepts a
 `completion_grace_period` in seconds, defaulting to `2.0`. The value must be a
 positive, finite `int` or `float`; booleans and non-numeric values are invalid.
-Existing constructor calls remain compatible.
+No coercion is performed: strings, `None`, containers, and arbitrary objects
+raise `TypeError`. Existing constructor calls remain compatible.
 
 When a native ID disappears from scheduler status output, do not infer
 success. Read `<work_directory>/<executor-name>/<native_id>.ec` without
@@ -241,17 +249,6 @@ types, missing required members, and unknown native states with `ValueError`.
   callback transition reconstruction, or the meaning of final job states.
 - Keep queue polling daemonized and scheduler-free verification deterministic;
   do not invoke real status commands from the probes or tests.
-- Keep optional plugin discovery diagnostic-safe: enabling DEBUG logging or
-  encountering a missing plugin descriptor must log and skip that descriptor,
-  not abort PSI/J package initialization.
-- Keep Flux submission stream mapping intact. When a Flux job supplies
-  `stdin_path`, `stdout_path`, or `stderr_path`, assign each path to the same
-  `JobspecV1` object that is submitted. Verification replaces the optional
-  Flux bindings with an in-process stub and does not contact a Flux service.
-- Keep the built-in multiple launcher's concurrent worker behavior. Each
-  worker must remain bounded by the positive-seconds
-  `PSIJ_MULTI_LAUNCH_TIMEOUT_SECONDS` override (default `1800`), and a worker
-  timeout or launcher interruption must not leave worker descendants running.
 - Do not replace PSI/J with a separate implementation or hard-code the probe
   fixtures.
 
