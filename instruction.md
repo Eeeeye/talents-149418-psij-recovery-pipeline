@@ -71,7 +71,11 @@ process after the exporting controller exits, without process memory, a
 sidecar file, or regeneration from unrelated inputs.
 
 Values outside JSON's null/boolean/number/string/list/object data model must
-cause export to fail with `TypeError` or `ValueError`.
+cause export to fail with `TypeError` or `ValueError`. A JSON number is finite:
+`NaN`, positive infinity, and negative infinity are invalid anywhere in a
+custom-attribute value, including inside a nested list or object. Reject those
+values during both export and import rather than accepting Python's
+non-standard JSON extensions.
 
 The on-disk document remains a JSON envelope with numeric `version`, string
 `type`, and object `data` members. `Import.load()` must continue to read
@@ -128,10 +132,12 @@ examples, and do not leak one scheduler's attributes into another scheduler's
 script. Any custom attribute containing a dot is scheduler-qualified. Its
 complete name must match
 `[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z][A-Za-z0-9_-]*`, and its value must be a
-non-empty printable string without CR, LF, or double-quote characters. Reject
-an invalid qualified name or value with `ValueError` or `TypeError` before
-emitting a submit script. A valid attribute for another scheduler is ignored,
-not leaked into the current scheduler's script.
+non-empty Unicode string for which Python's `str.isprintable()` is true, and
+it must not contain a double-quote character. In particular, a tab and every
+other control character (including CR and LF) are invalid. Reject an invalid
+qualified name or value with `ValueError` or `TypeError` before emitting a
+submit script. A valid attribute for another scheduler is ignored, not leaked
+into the current scheduler's script.
 
 ### 3. Monotonic state waiting
 
@@ -190,7 +196,9 @@ success. Read `<work_directory>/<executor-name>/<native_id>.ec` without
 consuming it. A valid record consists exactly of an ASCII signed decimal
 integer followed by LF or CRLF (`^-?[0-9]+\r?\n$`). Exit code zero means
 `COMPLETED`; a non-zero value means `FAILED` and the real exit code is
-preserved.
+preserved. The optional sign is minus only: a leading plus sign, surrounding
+whitespace, a missing line terminator, additional lines, or non-ASCII bytes
+makes the record invalid.
 
 Missing, empty, partial, undecodable, or otherwise malformed evidence keeps
 the job's previous non-final state during its native-ID-specific grace period.
