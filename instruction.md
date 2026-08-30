@@ -44,12 +44,8 @@ durations, paths, attributes, state sequences, and launcher output.
 
 ### 1. Restart-safe `JobSpec` persistence
 
-Keep the public compatibility API:
-
-```python
-Export().export(spec, path)  # returns True on success
-restored = Import().load(path)
-```
+Keep existing persistence callers compatible: a successful export returns
+true, and a successful load returns the reconstructed specification.
 
 For newly exported manifests, a round trip must preserve these values and
 their runtime types:
@@ -80,8 +76,8 @@ non-standard JSON extensions.
 The on-disk document remains a JSON envelope with required `version`, `type`,
 and `data` members. Their JSON kinds are exact: `version` is a number (a JSON
 boolean is not a number here), `type` is a string, and `data` is an object.
-`Import.load()` must continue to read version `0.1`, type `JobSpec` manifests
-such as `examples/legacy-job-v0.1.json`.
+The existing loader must continue to read version `0.1`, type `JobSpec`
+manifests such as `examples/legacy-job-v0.1.json`.
 
 Within `data`, `arguments` is an array or null; `inherit_environment` is a
 boolean; `environment` is an object with string keys and values or null; path
@@ -149,13 +145,13 @@ into the current scheduler's script.
 
 ### 3. Monotonic state waiting
 
-`Job.wait(timeout=..., target_states=...)` must accept either one `JobState`
-or a sequence. It returns as soon as the current state is a requested state,
-is strictly later than a requested state in PSI/J's existing partial order, or
-is any final state. This includes jobs that advance from `NEW` to a final
-state before the caller starts waiting. A real timeout still returns `None`.
-`timedelta(0)` is a non-blocking poll and returns `None` if no target has been
-reached.
+When a caller waits for a target state with an optional timeout, the existing
+public API must accept either one `JobState` or a sequence. It returns as soon
+as the current state is a requested state, is strictly later than a requested
+state in PSI/J's existing partial order, or is any final state. This includes
+jobs that advance from `NEW` to a final state before the caller starts waiting.
+A real timeout still returns `None`. A zero-duration timeout is a non-blocking
+poll and returns `None` if no target has been reached.
 Do not change the state transition order or callback behavior.
 
 ### 4. Launcher/user-error classification
@@ -193,11 +189,11 @@ every attached job must receive its own monotonic terminal transition.
 
 ### 7. Delayed and malformed completion evidence
 
-`BatchSchedulerExecutorConfig` accepts a
-`completion_grace_period` in seconds, defaulting to `2.0`. The value must be a
-positive, finite `int` or `float`; booleans and non-numeric values are invalid.
-No coercion is performed: strings, `None`, containers, and arbitrary objects
-raise `TypeError`. Existing constructor calls remain compatible.
+The existing batch-executor configuration exposes a completion grace period in
+seconds, defaulting to `2.0`. The value must be a positive, finite `int` or
+`float`; booleans and non-numeric values are invalid. No coercion is performed:
+strings, `None`, containers, and arbitrary objects raise `TypeError`. Existing
+constructor calls remain compatible.
 
 When a native ID disappears from scheduler status output, do not infer
 success. Read `<work_directory>/<executor-name>/<native_id>.ec` without
@@ -237,13 +233,20 @@ A scheduler row that is still present retains its reported PSI/J status.
   `STAT` members. A record containing an `ERROR` member is ignored and does
   not create a status entry.
 
+Diagnostic wording is not a fixed literal contract. A Slurm validation
+`ValueError` must identify the scheduler as either Slurm or `squeue` and make
+clear whether the defect concerns the status header, a status row, or an
+unknown state, as applicable. Equivalent phrases such as "Missing Slurm
+status header" and "Missing squeue status header" are both valid.
+
 All three status parsers reject a non-zero scheduler-command exit before
-parsing its payload. PBS Pro and LSF reject malformed JSON, wrong container
-types, missing required members, and unknown native states with `ValueError`.
+parsing its payload and raise `RuntimeError` whose message names the failed
+command (`squeue`, `qstat`, or `bjobs`). PBS Pro and LSF reject malformed JSON,
+wrong container types, missing required members, and unknown native states
+with `ValueError`.
 
 ## Preserved behavior
 
-- Keep the PSI/J 0.9.0 public class names and `Export`/`Import` call signatures.
 - Do not invoke real scheduler commands and do not require scheduler daemons.
 - Do not change resource constraint validation, environment inheritance,
   callback transition reconstruction, or the meaning of final job states.

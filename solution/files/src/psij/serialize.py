@@ -204,6 +204,10 @@ class Import(object):
     def load(self, src: str) -> object:
         with open(src, 'r', encoding='utf-8') as stream:
             envelope = json.load(stream, parse_constant=_reject_json_constant)
+        # Python's JSON decoder accepts overflowing exponent forms such as
+        # 1e999 and represents them as infinity, so validate the decoded tree
+        # in addition to rejecting the non-standard NaN/Infinity constants.
+        _validate_json_value(envelope, 'serialization envelope')
         if not isinstance(envelope, dict):
             raise TypeError('Serialization envelope must be an object')
         version = envelope.get('version')

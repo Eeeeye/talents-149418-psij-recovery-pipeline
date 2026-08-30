@@ -330,6 +330,28 @@ class PersistenceTests(unittest.TestCase):
                     with self.assertRaises((TypeError, ValueError)):
                         Import().load(str(path))
 
+    def test_overflowing_json_number_is_rejected_on_import(self) -> None:
+        data = minimal_manifest_data()
+        data["attributes"] = {
+            "duration": "0:10:00",
+            "queue_name": None,
+            "project_name": None,
+            "reservation_id": None,
+            "custom_attributes": {"payload": {"nested": ["OVERFLOW_SENTINEL"]}},
+        }
+        document = {
+            "version": 0.1,
+            "type": "JobSpec",
+            "data": data,
+        }
+        encoded = json.dumps(document).replace('"OVERFLOW_SENTINEL"', "1e999")
+        self.assertEqual(json.loads("1e999"), float("inf"))
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "overflow.json"
+            path.write_text(encoded, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                Import().load(str(path))
+
     def test_repeated_export_publishes_the_latest_complete_spec(self) -> None:
         first = complete_spec(duration=timedelta(hours=1))
         second = complete_spec(duration=timedelta(days=1, seconds=1))
@@ -956,14 +978,20 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         executor = object.__new__(SlurmJobExecutor)
         native_id = token("slurm-invalid-")
         cases = (
-            ("", "Missing squeue status header"),
-            (f"{native_id} R None\n", "Malformed squeue status header"),
-            (f"JOBID STATE REASON\n{native_id} ZZ unknown state\n", "Unknown Slurm state"),
-            (f"JOBID STATE REASON\n{native_id} R\n", "Malformed squeue status row"),
+            ("", "header"),
+            (f"{native_id} R None\n", "header"),
+            (f"JOBID STATE REASON\n{native_id} ZZ unknown state\n", "state"),
+            (f"JOBID STATE REASON\n{native_id} R\n", "row"),
         )
-        for output, message in cases:
-            with self.subTest(output=output), self.assertRaisesRegex(ValueError, message):
+        for output, defect_kind in cases:
+            with self.subTest(output=output), self.assertRaises(ValueError) as caught:
                 executor.parse_status_output(0, output)
+            message = str(caught.exception).casefold()
+            self.assertTrue(
+                "slurm" in message or "squeue" in message,
+                f"diagnostic must identify Slurm or squeue: {caught.exception!s}",
+            )
+            self.assertIn(defect_kind, message)
 
     def test_pbs_accepts_missing_optional_comment(self) -> None:
         executor = object.__new__(PBSProJobExecutor)
@@ -1037,9 +1065,9 @@ class SchedulerStatusParsingTests(unittest.TestCase):
             (object.__new__(LsfJobExecutor), "bjobs"),
         )
         for executor, command in cases:
-            with self.subTest(command=command), self.assertRaisesRegex(
-                    RuntimeError, command):
+            with self.subTest(command=command), self.assertRaises(RuntimeError) as caught:
                 executor.parse_status_output(23, token("scheduler-error-"))
+            self.assertIn(command, str(caught.exception).casefold())
 
     def test_json_status_parsers_reject_malformed_payloads(self) -> None:
         pbs = object.__new__(PBSProJobExecutor)

@@ -7,8 +7,8 @@ authors = []
 keywords = ["hpc", "psij", "batch-scheduler", "persistence", "recovery"]
 
 [metadata]
-difficulty = "hard"
-difficulty_explanation = "The repair crosses persistent JobSpec recovery, three scheduler dialects, asynchronous state ordering, launcher classification, process-local reapers after fork, weak-reference thread lifetime, in-flight same-ID attachment races, and delayed shared-filesystem completion evidence. Correctness requires coordinated multi-module concurrency and parsing changes plus exact timeout and file-format boundaries; the prior L1 strategy does not cover these independent failure chains."
+difficulty = "expert"
+difficulty_explanation = "The repair crosses persistent JobSpec recovery, three scheduler dialects, asynchronous state ordering, launcher classification, process-local reapers after fork, weak-reference thread lifetime, in-flight same-ID attachment races, and delayed shared-filesystem completion evidence. These are more than five independent, complex failure chains whose correctness requires coordinated multi-module concurrency and parsing changes plus exact timeout and file-format boundaries."
 category = "systems-engineering"
 
 [verifier]
