@@ -19,6 +19,7 @@ import weakref
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Iterable, Tuple, Type
+from unittest.mock import patch
 
 
 ROOT = Path("/workspace")
@@ -595,6 +596,42 @@ print(json.dumps({
                     with self.assertRaises((TypeError, ValueError)):
                         Import().load(str(path))
 
+    def test_every_manifest_path_field_uses_string_or_null_schema(self) -> None:
+        path_fields = (
+            "directory",
+            "stdin_path",
+            "stdout_path",
+            "stderr_path",
+            "pre_launch",
+            "post_launch",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "path-schema.json"
+            for field in path_fields:
+                for value in (None, f"/scratch/{field} with spaces"):
+                    with self.subTest(field=field, valid=value):
+                        data = minimal_manifest_data()
+                        data[field] = value
+                        path.write_text(
+                            json.dumps({"version": 0.1, "type": "JobSpec", "data": data}),
+                            encoding="utf-8",
+                        )
+                        restored = Import().load(str(path))
+                        assert isinstance(restored, JobSpec)
+                        expected = None if value is None else Path(value)
+                        self.assertEqual(getattr(restored, field), expected)
+
+                for value in (True, 7, [], {}):
+                    with self.subTest(field=field, invalid=value):
+                        data = minimal_manifest_data()
+                        data[field] = value
+                        path.write_text(
+                            json.dumps({"version": 0.1, "type": "JobSpec", "data": data}),
+                            encoding="utf-8",
+                        )
+                        with self.assertRaises(TypeError):
+                            Import().load(str(path))
+
     def test_failed_export_does_not_replace_existing_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "existing.json"
@@ -965,6 +1002,81 @@ class SchedulerStatusParsingTests(unittest.TestCase):
                 self.assertEqual(statuses[native_id].state, JobState.FAILED)
                 self.assertEqual(statuses[native_id].message, expected)
 
+    def test_every_native_scheduler_state_maps_to_expected_psij_state(self) -> None:
+        slurm_states = {
+            "BF": JobState.FAILED,
+            "CA": JobState.CANCELED,
+            "CD": JobState.COMPLETED,
+            "CF": JobState.QUEUED,
+            "CG": JobState.ACTIVE,
+            "DL": JobState.FAILED,
+            "F": JobState.FAILED,
+            "NF": JobState.FAILED,
+            "OOM": JobState.FAILED,
+            "PD": JobState.QUEUED,
+            "PR": JobState.FAILED,
+            "R": JobState.ACTIVE,
+            "RD": JobState.QUEUED,
+            "RF": JobState.QUEUED,
+            "RH": JobState.QUEUED,
+            "RQ": JobState.ACTIVE,
+            "SO": JobState.ACTIVE,
+            "TO": JobState.FAILED,
+            "RS": JobState.ACTIVE,
+            "RV": JobState.QUEUED,
+            "SI": JobState.ACTIVE,
+            "SE": JobState.ACTIVE,
+            "ST": JobState.ACTIVE,
+            "S": JobState.ACTIVE,
+        }
+        slurm = object.__new__(SlurmJobExecutor)
+        for native_state, expected in slurm_states.items():
+            native_id = token("slurm-state-")
+            output = f"JOBID STATE REASON\n{native_id} {native_state} offline reason\n"
+            with self.subTest(scheduler="slurm", native_state=native_state):
+                self.assertEqual(slurm.parse_status_output(0, output)[native_id].state, expected)
+
+        pbs_states = {
+            "B": JobState.ACTIVE,
+            "E": JobState.ACTIVE,
+            "F": JobState.COMPLETED,
+            "H": JobState.QUEUED,
+            "M": JobState.QUEUED,
+            "Q": JobState.QUEUED,
+            "R": JobState.ACTIVE,
+            "S": JobState.QUEUED,
+            "T": JobState.QUEUED,
+            "U": JobState.QUEUED,
+            "W": JobState.QUEUED,
+            "X": JobState.COMPLETED,
+        }
+        pbs = object.__new__(PBSProJobExecutor)
+        for native_state, expected in pbs_states.items():
+            native_id = token("pbs-state-")
+            output = json.dumps({"Jobs": {native_id: {"job_state": native_state}}})
+            with self.subTest(scheduler="pbs", native_state=native_state):
+                self.assertEqual(pbs.parse_status_output(0, output)[native_id].state, expected)
+
+        lsf_states = {
+            "PEND": JobState.QUEUED,
+            "PROV": JobState.QUEUED,
+            "PSUSP": JobState.QUEUED,
+            "RUN": JobState.ACTIVE,
+            "USUSP": JobState.ACTIVE,
+            "SSUSP": JobState.ACTIVE,
+            "DONE": JobState.COMPLETED,
+            "EXIT": JobState.FAILED,
+            "UNKWN": JobState.ACTIVE,
+            "WAIT": JobState.QUEUED,
+            "ZOMBI": JobState.ACTIVE,
+        }
+        lsf = object.__new__(LsfJobExecutor)
+        for native_state, expected in lsf_states.items():
+            native_id = token("lsf-state-")
+            output = json.dumps({"RECORDS": [{"JOBID": native_id, "STAT": native_state}]})
+            with self.subTest(scheduler="lsf", native_state=native_state):
+                self.assertEqual(lsf.parse_status_output(0, output)[native_id].state, expected)
+
     def test_slurm_preserves_spaced_and_unknown_failure_reason(self) -> None:
         executor = object.__new__(SlurmJobExecutor)
         native_id = token("slurm-")
@@ -1044,6 +1156,14 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         self.assertEqual(statuses[native_id].state, JobState.FAILED)
         self.assertEqual(statuses[native_id].message, reason)
 
+    def test_lsf_missing_reason_members_are_valid_and_yield_no_message(self) -> None:
+        executor = object.__new__(LsfJobExecutor)
+        native_id = token("lsf-no-reason-")
+        output = json.dumps({"RECORDS": [{"JOBID": native_id, "STAT": "EXIT"}]})
+        status = executor.parse_status_output(0, output)[native_id]
+        self.assertEqual(status.state, JobState.FAILED)
+        self.assertIsNone(status.message)
+
     def test_lsf_error_records_are_ignored_without_hiding_valid_records(self) -> None:
         executor = object.__new__(LsfJobExecutor)
         native_id = token("lsf-valid-")
@@ -1103,6 +1223,75 @@ class SchedulerStatusParsingTests(unittest.TestCase):
                 with self.subTest(scheduler=scheduler, payload=payload), \
                         self.assertRaises(ValueError):
                     executor.parse_status_output(0, payload)
+
+    def test_scheduler_status_fields_use_the_exact_declared_json_types(self) -> None:
+        pbs = object.__new__(PBSProJobExecutor)
+        native_id = token("pbs-schema-")
+        valid = json.dumps({
+            "Jobs": {native_id: {"job_state": "R", "comment": None}},
+        })
+        status = pbs.parse_status_output(0, valid)[native_id]
+        self.assertEqual(status.state, JobState.ACTIVE)
+        self.assertIsNone(status.message)
+
+        for value in (None, True, 7, []):
+            payload = json.dumps({"Jobs": {native_id: {"job_state": value}}})
+            with self.subTest(field="job_state", value=value), self.assertRaises(ValueError):
+                pbs.parse_status_output(0, payload)
+        for value in (None, True, 7.5, "7", []):
+            payload = json.dumps({
+                "Jobs": {native_id: {"job_state": "R", "Exit_status": value}},
+            })
+            with self.subTest(field="Exit_status", value=value), self.assertRaises(ValueError):
+                pbs.parse_status_output(0, payload)
+        for value in (True, 7, [], {}):
+            payload = json.dumps({
+                "Jobs": {native_id: {"job_state": "R", "comment": value}},
+            })
+            with self.subTest(field="comment", value=value), self.assertRaises(ValueError):
+                pbs.parse_status_output(0, payload)
+
+        lsf = object.__new__(LsfJobExecutor)
+        for field in ("JOBID", "STAT"):
+            for value in (None, True, 7, []):
+                record = {"JOBID": native_id, "STAT": "RUN"}
+                record[field] = value
+                payload = json.dumps({"RECORDS": [record]})
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    lsf.parse_status_output(0, payload)
+
+    def test_status_contract_is_verified_without_invoking_scheduler_binaries(self) -> None:
+        slurm = object.__new__(SlurmJobExecutor)
+        pbs = object.__new__(PBSProJobExecutor)
+        lsf = object.__new__(LsfJobExecutor)
+        native_id = token("offline-status-")
+        with patch.object(
+                BatchSchedulerExecutor,
+                "_run_command",
+                side_effect=AssertionError("a real scheduler command was invoked")):
+            commands = (
+                slurm.get_status_command([native_id]),
+                pbs.get_status_command([native_id]),
+                lsf.get_status_command([native_id]),
+            )
+            self.assertEqual([command[0] for command in commands], ["squeue", "qstat", "bjobs"])
+            self.assertEqual(
+                slurm.parse_status_output(
+                    0, f"JOBID STATE REASON\n{native_id} R None\n")[native_id].state,
+                JobState.ACTIVE,
+            )
+            self.assertEqual(
+                pbs.parse_status_output(
+                    0, json.dumps({"Jobs": {native_id: {"job_state": "R"}}})
+                )[native_id].state,
+                JobState.ACTIVE,
+            )
+            self.assertEqual(
+                lsf.parse_status_output(
+                    0, json.dumps({"RECORDS": [{"JOBID": native_id, "STAT": "RUN"}]})
+                )[native_id].state,
+                JobState.ACTIVE,
+            )
 
 
 def render_script(executor_type: Type[BatchSchedulerExecutor], config: object,
