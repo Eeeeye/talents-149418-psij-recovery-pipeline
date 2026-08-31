@@ -76,15 +76,20 @@ non-standard JSON extensions.
 The on-disk document remains a JSON envelope with required `version`, `type`,
 and `data` members. Their JSON kinds are exact: `version` is a number (a JSON
 boolean is not a number here), `type` is a string, and `data` is an object.
+Omitting any of those three members is invalid; `true` and `false` must be
+rejected as envelope versions, and `null` must be rejected as envelope data.
 The existing loader must continue to read version `0.1`, type `JobSpec`
 manifests such as `examples/legacy-job-v0.1.json`.
 
 Within `data`, `arguments` is an array or null; `inherit_environment` is a
 boolean; `environment` is an object with string keys and values or null; path
 members are strings or null; and `resources` and `attributes` are objects or
-null. `attributes.custom_attributes` is an object or null. A legacy resource
-object may use `process_per_node` to mean `processes_per_node`; if both names
-are present with different values, the manifest is invalid. A legacy duration
+null. If present, `resources.version` is a JSON number equal to `1`; a JSON
+boolean is not a valid resource version. `attributes.custom_attributes` is an
+object or null, and its null value must survive export and import as null. A
+legacy resource object may use `process_per_node` to mean
+`processes_per_node`; if both names are present with different values, the
+manifest is invalid. A legacy duration
 is the canonical text produced by `str(datetime.timedelta(...))`, with hour,
 minute, and second components in `00..23`, `00..59`, and `00..59`; it must be
 restored as a `timedelta`. Fields absent from an old manifest default to the

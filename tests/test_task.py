@@ -265,6 +265,32 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(document["data"]["post_launch"], str(original.post_launch))
             self.assertEqual(document["data"]["launcher"], "single")
 
+    def test_default_custom_attributes_round_trip_preserves_null(self) -> None:
+        original = JobSpec()
+        self.assertIsNone(original.attributes._custom_attributes)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "default-manifest.json"
+            self.assertIs(Export().export(original, str(path)), True)
+            document = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIsNone(document["data"]["attributes"]["custom_attributes"])
+            restored = Import().load(str(path))
+
+        self.assertIsInstance(restored, JobSpec)
+        assert isinstance(restored, JobSpec)
+        self.assertIsNone(restored.attributes._custom_attributes)
+
+    def test_resource_version_rejects_json_boolean(self) -> None:
+        data = minimal_manifest_data()
+        data["resources"] = {"version": True}
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "boolean-resource-version.json"
+            path.write_text(
+                json.dumps({"version": 0.1, "type": "JobSpec", "data": data}),
+                encoding="utf-8",
+            )
+            with self.assertRaises((TypeError, ValueError)):
+                Import().load(str(path))
+
     def test_json_custom_attribute_types_are_not_stringified(self) -> None:
         nested = {
             "flag": True,

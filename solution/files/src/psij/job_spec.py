@@ -174,8 +174,7 @@ class JobSpec(object):
                 'queue_name': self.attributes.queue_name,
                 'project_name': self.attributes.project_name,
                 'reservation_id': self.attributes.reservation_id,
-                'custom_attributes': self.attributes._custom_attributes
-                if self.attributes._custom_attributes is not None else {},
+                'custom_attributes': self.attributes._custom_attributes,
             }
         else:
             d['attributes'] = None

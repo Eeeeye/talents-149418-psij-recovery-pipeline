@@ -125,7 +125,7 @@ class Import(object):
         if not isinstance(value, dict):
             raise TypeError('resources must be an object or null')
         version = value.get('version', 1)
-        if version != 1:
+        if isinstance(version, bool) or not isinstance(version, (int, float)) or version != 1:
             raise ValueError('Unsupported ResourceSpec version: %r' % version)
         old_ppn = value.get('process_per_node')
         new_ppn = value.get('processes_per_node')
@@ -151,7 +151,7 @@ class Import(object):
             raise TypeError('attributes must be an object or null')
         duration_value = value.get('duration', str(timedelta(minutes=10)))
         duration = _duration_from_text(duration_value)
-        custom = value.get('custom_attributes', {})
+        custom = value.get('custom_attributes')
         if custom is not None and not isinstance(custom, dict):
             raise TypeError('custom_attributes must be an object or null')
         return JobAttributes(
