@@ -496,6 +496,45 @@ print(json.dumps({
         self.assertIsNone(restored.pre_launch)
         self.assertIsNone(restored.post_launch)
 
+    def test_legacy_duration_requires_exact_canonical_timedelta_text(self) -> None:
+        canonical_duration = timedelta(
+            days=2,
+            hours=3,
+            minutes=4,
+            seconds=5,
+            microseconds=6000,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "duration.json"
+            data = minimal_manifest_data()
+            data["attributes"] = {
+                "duration": str(canonical_duration),
+                "custom_attributes": {},
+            }
+            path.write_text(
+                json.dumps({"version": 0.1, "type": "JobSpec", "data": data}),
+                encoding="utf-8",
+            )
+            restored = Import().load(str(path))
+            assert isinstance(restored, JobSpec)
+            self.assertEqual(restored.attributes.duration, canonical_duration)
+
+            noncanonical_values = (
+                "0:00:01.0",
+                "0:00:01.000000",
+                "00:00:01",
+                "1 days, 0:00:00",
+            )
+            for value in noncanonical_values:
+                with self.subTest(value=value):
+                    data["attributes"]["duration"] = value
+                    path.write_text(
+                        json.dumps({"version": 0.1, "type": "JobSpec", "data": data}),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises((TypeError, ValueError)):
+                        Import().load(str(path))
+
     def test_legacy_missing_fields_use_new_jobspec_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "minimal-legacy.json"

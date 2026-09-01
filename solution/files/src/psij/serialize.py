@@ -31,7 +31,10 @@ def _duration_from_text(value: object) -> timedelta:
     seconds = float(match.group('seconds'))
     if hours > 23 or minutes > 59 or seconds >= 60:
         raise ValueError('Invalid timedelta value: %r' % value)
-    return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+    duration = timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+    if str(duration) != value:
+        raise ValueError('Invalid timedelta value: %r' % value)
+    return duration
 
 
 def _optional_path(value: object, field: str) -> Optional[Path]:
