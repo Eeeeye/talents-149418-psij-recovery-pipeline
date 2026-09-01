@@ -1605,6 +1605,26 @@ class LauncherClassificationTests(unittest.TestCase):
         self.assertIn(diagnostic, message)
         self.assertIn("second detail", message)
 
+    def test_nonfinal_complete_marker_is_not_reported_as_failure_text(self) -> None:
+        diagnostic = token("wrapper-failed-")
+        trailing = token("trailing-output-")
+        for newline in ("\n", "\r\n"):
+            output = newline.join(
+                (diagnostic, "_PSI_J_LAUNCHER_DONE", trailing, "")
+            )
+            with self.subTest(newline=repr(newline)):
+                self.assertTrue(self.launcher.is_launcher_failure(output))
+                message = self.launcher.get_launcher_failure_message(output)
+                self.assertIn(diagnostic, message)
+                self.assertIn(trailing, message)
+                self.assertNotIn("_PSI_J_LAUNCHER_DONE", message)
+
+        partial = "_PSI_J_LAUNCHER_DON\n" + trailing + "\n"
+        self.assertIn(
+            "_PSI_J_LAUNCHER_DON",
+            self.launcher.get_launcher_failure_message(partial),
+        )
+
     def test_local_nonzero_program_is_not_mislabeled_as_launcher_failure(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-local-") as td:
             root = Path(td)

@@ -217,4 +217,8 @@ class ScriptBasedLauncher(Launcher):
             else:
                 body = output[:-1]
             return body.rsplit('\n', maxsplit=1)[0] if '\n' in body else ''
-        return output.rstrip('\r\n')
+        diagnostics = ''.join(
+            line for line in output.splitlines(keepends=True)
+            if line not in ('_PSI_J_LAUNCHER_DONE\n', '_PSI_J_LAUNCHER_DONE\r\n')
+        )
+        return diagnostics.rstrip('\r\n')
