@@ -98,8 +98,10 @@ same value as a newly constructed `JobSpec`.
 Reject malformed JSON, unsupported envelope versions or types, non-object
 `data`, unknown resource-spec versions, and malformed durations with a clear
 `ValueError` or `TypeError`; do not return a partially restored `JobSpec`.
-If export-time validation or JSON serialization fails, an already existing
-destination file must remain byte-for-byte unchanged.
+Export validation and serialization complete before publication. If either
+fails, a destination that did not exist must remain absent, and an already
+existing destination must remain byte-for-byte unchanged; do not leave a
+partial manifest at the destination path.
 
 ### 2. Scheduler-native batch directives after recovery
 
@@ -117,6 +119,11 @@ next representable whole second; LSF rounds up to the next whole minute.
 Hours, minutes, and seconds must be integers; minute and second components
 must be within `00..59`. The resulting directives must be syntactically valid
 for the named scheduler.
+
+Directive verification uses each scheduler's native option/value semantics.
+Where the scheduler syntax permits both forms, `--key=value` and
+`--key value`, quoted and unquoted equivalent values, and directive ordering
+are not distinct behaviors; the sample spelling and ordering are not fixed.
 
 Built-in attributes use these native mappings:
 
@@ -197,6 +204,9 @@ If another `Job` attaches to the same native ID while that poll is in flight,
 a terminal result may remove only the `Job` objects in that snapshot. The late
 attachment and its completion files must remain available for a later poll;
 every attached job must receive its own monotonic terminal transition.
+When a later poll has finalized the last remaining attachment for that native
+ID, remove its completion record and per-ID tracking. Never perform that
+cleanup while any late attachment still needs the evidence.
 
 ### 7. Delayed and malformed completion evidence
 
