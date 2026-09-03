@@ -62,6 +62,11 @@ their runtime types:
   values without converting booleans, integers, lists, dictionaries, or
   `None` to strings.
 
+An unset `name` remains unset across the restart even when `executable` is
+present. Preserve the existing fallback relationship: if the executable is
+changed after loading, the effective `name` must follow the new executable
+rather than remaining frozen to the pre-restart executable.
+
 The JSON manifest is self-contained: it must remain loadable by a fresh Python
 process after the exporting controller exits, without process memory, a
 sidecar file, or regeneration from unrelated inputs.
@@ -92,7 +97,9 @@ legacy resource object may use `process_per_node` to mean
 manifest is invalid. A legacy duration
 is the canonical text produced by `str(datetime.timedelta(...))`, with hour,
 minute, and second components in `00..23`, `00..59`, and `00..59`; it must be
-restored as a `timedelta`. Fields absent from an old manifest default to the
+restored as a `timedelta`. This includes canonical negative timedeltas, whose
+normalized text uses a signed day component such as
+`-1 day, 23:59:59.999999`. Fields absent from an old manifest default to the
 same value as a newly constructed `JobSpec`.
 
 Reject malformed JSON, unsupported envelope versions or types, non-object
@@ -180,6 +187,12 @@ by a normal LF or CRLF line ending. Earlier diagnostic lines are allowed.
 Trailing non-empty output, a partial marker, or no marker is a launcher
 failure. Launcher failure messages must retain the useful diagnostic text and
 must not report the valid completion marker itself as an error.
+
+A same-line prefix before `_PSI_J_LAUNCHER_DONE` means that logical line is not
+the exact marker. Likewise, the complete marker text without a terminating LF
+or CRLF is not valid completion evidence. Both cases remain launcher failures,
+and their malformed, unterminated, or prefixed line must remain in the derived
+failure message rather than being silently removed.
 
 When a local job executable exits non-zero after a valid launcher completion,
 the job remains `FAILED` with its real exit code, but it must not acquire a

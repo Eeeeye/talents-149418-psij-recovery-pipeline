@@ -280,6 +280,20 @@ class PersistenceTests(unittest.TestCase):
         assert isinstance(restored, JobSpec)
         self.assertIsNone(restored.attributes._custom_attributes)
 
+    def test_unset_name_keeps_executable_fallback_after_round_trip(self) -> None:
+        original = JobSpec(name=None, executable="/bin/true")
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "unset-name.json"
+            Export().export(original, str(path))
+            restored = Import().load(str(path))
+
+        self.assertIsInstance(restored, JobSpec)
+        assert isinstance(restored, JobSpec)
+        self.assertEqual(restored.name, "/bin/true")
+        original.executable = "/bin/false"
+        restored.executable = "/bin/false"
+        self.assertEqual(restored.name, original.name)
+
     def test_resource_version_rejects_json_boolean(self) -> None:
         data = minimal_manifest_data()
         data["resources"] = {"version": True}
@@ -546,6 +560,28 @@ print(json.dumps({
                     )
                     with self.assertRaises((TypeError, ValueError)):
                         Import().load(str(path))
+
+    def test_negative_canonical_legacy_duration_round_trips(self) -> None:
+        durations = (
+            timedelta(microseconds=-1),
+            timedelta(days=-3, seconds=17, microseconds=4000),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "negative-duration.json"
+            for expected in durations:
+                with self.subTest(duration=expected):
+                    data = minimal_manifest_data()
+                    data["attributes"] = {
+                        "duration": str(expected),
+                        "custom_attributes": None,
+                    }
+                    path.write_text(
+                        json.dumps({"version": 0.1, "type": "JobSpec", "data": data}),
+                        encoding="utf-8",
+                    )
+                    restored = Import().load(str(path))
+                    assert isinstance(restored, JobSpec)
+                    self.assertEqual(restored.attributes.duration, expected)
 
     def test_legacy_missing_fields_use_new_jobspec_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1732,6 +1768,18 @@ class LauncherClassificationTests(unittest.TestCase):
             "_PSI_J_LAUNCHER_DON",
             self.launcher.get_launcher_failure_message(partial),
         )
+
+    def test_prefixed_marker_is_not_an_exact_final_logical_line(self) -> None:
+        output = token("same-line-prefix-") + "_PSI_J_LAUNCHER_DONE\n"
+        self.assertTrue(self.launcher.is_launcher_failure(output))
+        message = self.launcher.get_launcher_failure_message(output)
+        self.assertIn("same-line-prefix-", message)
+        self.assertIn("_PSI_J_LAUNCHER_DONE", message)
+
+    def test_unterminated_complete_marker_remains_failure_evidence(self) -> None:
+        output = "_PSI_J_LAUNCHER_DONE"
+        self.assertTrue(self.launcher.is_launcher_failure(output))
+        self.assertEqual(self.launcher.get_launcher_failure_message(output), output)
 
     def test_local_nonzero_program_is_not_mislabeled_as_launcher_failure(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-local-") as td:
