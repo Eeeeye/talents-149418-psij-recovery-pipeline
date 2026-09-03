@@ -19,7 +19,7 @@ import warnings
 import weakref
 from datetime import timedelta
 from pathlib import Path
-from typing import Dict, Iterable, Tuple, Type
+from typing import Dict, Iterable, Type
 from unittest.mock import patch
 
 
@@ -292,24 +292,36 @@ class PersistenceTests(unittest.TestCase):
             with self.assertRaises((TypeError, ValueError)):
                 Import().load(str(path))
 
-    def test_json_custom_attribute_types_are_not_stringified(self) -> None:
-        nested = {
-            "flag": True,
-            "count": 17,
-            "ratio": 2.5,
-            "unset": None,
-            "list": [1, False, None, "值"],
-            "dict": {"inner": 9},
-        }
-        original = complete_spec(custom={"slurm.extra": nested, "plain": [1, 2, 3]})
+    def _assert_custom_value_round_trips(self, value: object) -> None:
+        original = complete_spec(custom={"payload": value})
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "manifest.json"
             Export().export(original, str(path))
             restored = Import().load(str(path))
         assert isinstance(restored, JobSpec)
-        self.assertEqual(restored.attributes._custom_attributes, original.attributes._custom_attributes)
-        self.assertIs(restored.attributes._custom_attributes["slurm.extra"]["flag"], True)
-        self.assertIsNone(restored.attributes._custom_attributes["slurm.extra"]["unset"])
+        restored_value = restored.attributes._custom_attributes["payload"]
+        self.assertEqual(restored_value, value)
+        self.assertIs(type(restored_value), type(value))
+
+    def test_json_null_custom_attribute_round_trips_without_stringification(self) -> None:
+        self._assert_custom_value_round_trips(None)
+
+    def test_json_boolean_custom_attribute_round_trips_without_stringification(self) -> None:
+        self._assert_custom_value_round_trips(True)
+        self._assert_custom_value_round_trips(False)
+
+    def test_json_number_custom_attribute_round_trips_without_stringification(self) -> None:
+        self._assert_custom_value_round_trips(17)
+        self._assert_custom_value_round_trips(2.5)
+
+    def test_json_string_custom_attribute_round_trips_without_stringification(self) -> None:
+        self._assert_custom_value_round_trips("值")
+
+    def test_json_list_custom_attribute_round_trips_without_stringification(self) -> None:
+        self._assert_custom_value_round_trips([1, False, None, "值"])
+
+    def test_json_object_custom_attribute_round_trips_without_stringification(self) -> None:
+        self._assert_custom_value_round_trips({"inner": 9, "flag": True, "unset": None})
 
     def test_nested_non_finite_custom_attributes_fail_export_atomically(self) -> None:
         invalid_values = {
@@ -698,25 +710,32 @@ print(json.dumps({
                         with self.assertRaises((TypeError, ValueError)):
                             Import().load(str(path))
 
-    def test_failed_export_does_not_replace_existing_manifest(self) -> None:
+    def test_non_json_custom_attribute_types_are_rejected_before_publication(self) -> None:
+        invalid_values = (
+            {1, 2, 3},
+            {1: "non-string-key"},
+            ("tuple",),
+        )
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "existing.json"
-            for invalid in (
-                {1, 2, 3},
-                {1: "non-string-key"},
-                ("tuple",),
-                float("nan"),
-                float("inf"),
-                float("-inf"),
-            ):
+            root = Path(td)
+            for index, invalid in enumerate(invalid_values):
                 with self.subTest(invalid=repr(invalid)):
-                    sentinel = secrets.token_bytes(96)
-                    path.write_bytes(sentinel)
+                    path = root / f"invalid-{index}.json"
                     spec = complete_spec(custom={"invalid": invalid})
                     with self.assertRaises((TypeError, ValueError)):
                         Export().export(spec, str(path))
-                    self.assertEqual(path.read_bytes(), sentinel)
-                    self.assertEqual(list(path.parent.iterdir()), [path])
+                    self.assertFalse(path.exists())
+
+    def test_failed_export_does_not_replace_existing_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "existing.json"
+            sentinel = secrets.token_bytes(96)
+            path.write_bytes(sentinel)
+            spec = complete_spec(custom={"invalid": ("tuple",)})
+            with self.assertRaises((TypeError, ValueError)):
+                Export().export(spec, str(path))
+            self.assertEqual(path.read_bytes(), sentinel)
+            self.assertEqual(list(path.parent.iterdir()), [path])
 
 
 class ModificationBoundaryTests(unittest.TestCase):
@@ -946,30 +965,39 @@ class RecoveryConcurrencyTests(unittest.TestCase):
                 self.assertIn(native_id, job.status.message)
                 self.assertIn(evidence_kind, job.status.message)
 
+    def _poll_while_attaching_same_native_id(
+            self, root: Path) -> tuple[_OfflineRecoveryExecutor, str, Job, Job]:
+        executor = _OfflineRecoveryExecutor(root)
+        executor.work_directory.mkdir(parents=True)
+        native_id = token("native-")
+        (executor.work_directory / f"{native_id}.ec").write_text("0\n", encoding="ascii")
+        first = _register_recovered_job(executor, native_id)
+        executor.poll_started = threading.Event()
+        executor.poll_release = threading.Event()
+
+        poll = threading.Thread(target=executor._queue_poll_thread._poll)
+        poll.start()
+        self.assertTrue(executor.poll_started.wait(1), "poll did not reach barrier")
+        second = _register_recovered_job(executor, native_id)
+        executor.poll_release.set()
+        poll.join(2)
+        self.assertFalse(poll.is_alive(), "barrier-controlled poll did not return")
+        return executor, native_id, first, second
+
     def test_inflight_poll_preserves_same_id_late_attachment(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-poll-race-") as td:
-            executor = _OfflineRecoveryExecutor(Path(td))
-            executor.work_directory.mkdir(parents=True)
-            native_id = token("native-")
-            (executor.work_directory / f"{native_id}.ec").write_text("0\n", encoding="ascii")
-            first = _register_recovered_job(executor, native_id)
-            executor.poll_started = threading.Event()
-            executor.poll_release = threading.Event()
-
-            poll = threading.Thread(target=executor._queue_poll_thread._poll)
-            poll.start()
-            self.assertTrue(executor.poll_started.wait(1), "poll did not reach barrier")
-            second = _register_recovered_job(executor, native_id)
-            executor.poll_release.set()
-            poll.join(2)
-            self.assertFalse(poll.is_alive(), "barrier-controlled poll did not return")
-
+            executor, native_id, first, second = \
+                self._poll_while_attaching_same_native_id(Path(td))
             self.assertEqual(first.status.state, JobState.COMPLETED)
             self.assertEqual(first.status.exit_code, 0)
             self.assertEqual(second.status.state, JobState.ACTIVE)
             self.assertTrue((executor.work_directory / f"{native_id}.ec").is_file())
             self.assertEqual(executor._queue_poll_thread._jobs[native_id], [second])
 
+    def test_late_attachment_completes_and_cleans_up_on_a_later_poll(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-poll-later-") as td:
+            executor, native_id, _first, second = \
+                self._poll_while_attaching_same_native_id(Path(td))
             executor.poll_started = None
             executor.poll_release = None
             executor._queue_poll_thread._poll()
@@ -1266,9 +1294,6 @@ class SchedulerStatusParsingTests(unittest.TestCase):
             json.dumps({"Jobs": {"42.server": []}}),
             json.dumps({"Jobs": {"42.server": {}}}),
             json.dumps({"Jobs": {"42.server": {"job_state": "UNKNOWN"}}}),
-            json.dumps({"Jobs": {"42.server": {"job_state": "F", "Exit_status": "7"}}}),
-            json.dumps({"Jobs": {"42.server": {"job_state": "R", "Exit_status": None}}}),
-            json.dumps({"Jobs": {"42.server": {"job_state": "R", "comment": 7}}}),
         )
         lsf_cases = (
             "{truncated",
@@ -1290,9 +1315,32 @@ class SchedulerStatusParsingTests(unittest.TestCase):
                         self.assertRaises(ValueError):
                     executor.parse_status_output(0, payload)
 
-    def test_scheduler_status_fields_use_the_exact_declared_json_types(self) -> None:
+    def test_pbs_job_state_requires_a_json_string(self) -> None:
         pbs = object.__new__(PBSProJobExecutor)
         native_id = token("pbs-schema-")
+        for value in (None, True, 7, []):
+            payload = json.dumps({"Jobs": {native_id: {"job_state": value}}})
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                pbs.parse_status_output(0, payload)
+
+    def test_pbs_exit_status_requires_a_json_integer_when_present(self) -> None:
+        pbs = object.__new__(PBSProJobExecutor)
+        native_id = token("pbs-exit-schema-")
+        for value in (None, True, 7.5, "7", []):
+            payload = json.dumps({
+                "Jobs": {native_id: {"job_state": "R", "Exit_status": value}},
+            })
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                pbs.parse_status_output(0, payload)
+
+        valid = json.dumps({
+            "Jobs": {native_id: {"job_state": "R", "Exit_status": 0}},
+        })
+        self.assertEqual(pbs.parse_status_output(0, valid)[native_id].state, JobState.ACTIVE)
+
+    def test_pbs_comment_requires_a_json_string_or_null(self) -> None:
+        pbs = object.__new__(PBSProJobExecutor)
+        native_id = token("pbs-comment-schema-")
         valid = json.dumps({
             "Jobs": {native_id: {"job_state": "R", "comment": None}},
         })
@@ -1300,24 +1348,16 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         self.assertEqual(status.state, JobState.ACTIVE)
         self.assertIsNone(status.message)
 
-        for value in (None, True, 7, []):
-            payload = json.dumps({"Jobs": {native_id: {"job_state": value}}})
-            with self.subTest(field="job_state", value=value), self.assertRaises(ValueError):
-                pbs.parse_status_output(0, payload)
-        for value in (None, True, 7.5, "7", []):
-            payload = json.dumps({
-                "Jobs": {native_id: {"job_state": "R", "Exit_status": value}},
-            })
-            with self.subTest(field="Exit_status", value=value), self.assertRaises(ValueError):
-                pbs.parse_status_output(0, payload)
         for value in (True, 7, [], {}):
             payload = json.dumps({
                 "Jobs": {native_id: {"job_state": "R", "comment": value}},
             })
-            with self.subTest(field="comment", value=value), self.assertRaises(ValueError):
+            with self.subTest(value=value), self.assertRaises(ValueError):
                 pbs.parse_status_output(0, payload)
 
+    def test_lsf_job_id_and_state_require_json_strings(self) -> None:
         lsf = object.__new__(LsfJobExecutor)
+        native_id = token("lsf-schema-")
         for field in ("JOBID", "STAT"):
             for value in (None, True, 7, []):
                 record = {"JOBID": native_id, "STAT": "RUN"}
@@ -1383,20 +1423,52 @@ def render_all(spec: JobSpec) -> Dict[str, str]:
         }
 
 
-def directive_value(script: str, pattern: str) -> str:
-    match = re.search(pattern, script, flags=re.MULTILINE)
-    if match is None:
-        raise AssertionError(f"missing directive matching {pattern!r}\n{script}")
-    return match.group(1)
+def parsed_scheduler_options(script: str, prefix: str) -> Dict[str, list[str | None]]:
+    """Parse scheduler directives into order- and quoting-independent options."""
+    options: Dict[str, list[str | None]] = {}
+    for line in script.splitlines():
+        if not line.startswith(prefix):
+            continue
+        tokens = shlex.split(line[len(prefix):].strip())
+        if not tokens:
+            continue
+        flag, *arguments = tokens
+        if flag.startswith("--"):
+            option = flag[2:]
+            if "=" in option:
+                name, value = option.split("=", 1)
+                if arguments:
+                    raise AssertionError(f"unexpected arguments after {flag!r}: {line!r}")
+            else:
+                name = option
+                if len(arguments) > 1:
+                    raise AssertionError(f"ambiguous directive arguments: {line!r}")
+                value = arguments[0] if arguments else None
+        elif flag.startswith("-"):
+            option = flag[1:]
+            if "=" in option:
+                name, value = option.split("=", 1)
+                if arguments:
+                    raise AssertionError(f"unexpected arguments after {flag!r}: {line!r}")
+            else:
+                name = option
+                if len(arguments) > 1:
+                    raise AssertionError(f"ambiguous directive arguments: {line!r}")
+                value = arguments[0] if arguments else None
+        else:
+            raise AssertionError(f"directive does not begin with an option: {line!r}")
+        if name == "l" and value is not None and "=" in value:
+            resource, value = value.split("=", 1)
+            name = f"l:{resource}"
+        options.setdefault(name, []).append(value)
+    return options
 
 
-def parsed_directives(script: str, prefix: str) -> list[Tuple[str, ...]]:
-    """Return directive arguments without binding tests to shell quoting."""
-    return [
-        tuple(shlex.split(line[len(prefix):].strip()))
-        for line in script.splitlines()
-        if line.startswith(prefix)
-    ]
+def single_option_value(script: str, prefix: str, name: str) -> str:
+    values = parsed_scheduler_options(script, prefix).get(name)
+    if values is None or len(values) != 1 or values[0] is None:
+        raise AssertionError(f"expected one value for {prefix} {name!r}: {values!r}\n{script}")
+    return values[0]
 
 
 def parse_hms(value: str, allow_days: bool) -> int:
@@ -1432,13 +1504,13 @@ class BatchRenderingTests(unittest.TestCase):
                 scripts = render_all(complete_spec(duration=duration, custom={}))
                 expected_seconds = math.ceil(duration.total_seconds())
 
-                slurm = directive_value(scripts["slurm"], r"^#SBATCH --time=([^\s]+)$")
+                slurm = single_option_value(scripts["slurm"], "#SBATCH", "time")
                 self.assertEqual(parse_hms(slurm, allow_days=True), expected_seconds)
 
-                pbs = directive_value(scripts["pbs"], r"^#PBS -l walltime=([^\s]+)$")
+                pbs = single_option_value(scripts["pbs"], "#PBS", "l:walltime")
                 self.assertEqual(parse_hms(pbs, allow_days=False), expected_seconds)
 
-                lsf = directive_value(scripts["lsf"], r"^#BSUB -W ([^\s]+)$")
+                lsf = single_option_value(scripts["lsf"], "#BSUB", "W")
                 pieces = lsf.split(":")
                 self.assertEqual(len(pieces), 2)
                 hours, minutes = (int(piece) for piece in pieces)
@@ -1446,7 +1518,39 @@ class BatchRenderingTests(unittest.TestCase):
                 self.assertTrue(0 <= minutes <= 59)
                 self.assertEqual(hours * 60 + minutes, math.ceil(expected_seconds / 60))
 
-    def test_builtins_and_random_custom_attributes_render_without_cross_leakage(self) -> None:
+    def test_builtin_scheduler_attributes_use_native_option_semantics(self) -> None:
+        spec = complete_spec(custom={})
+        scripts = render_all(spec)
+
+        slurm = parsed_scheduler_options(scripts["slurm"], "#SBATCH")
+        self.assertEqual(slurm.get("partition"), [spec.attributes.queue_name])
+        self.assertEqual(slurm.get("account"), [spec.attributes.project_name])
+        self.assertEqual(slurm.get("reservation"), [spec.attributes.reservation_id])
+
+        pbs_queue_spec = complete_spec(custom={})
+        pbs_queue_spec.attributes.reservation_id = None
+        pbs_queue = parsed_scheduler_options(
+            render_all(pbs_queue_spec)["pbs"], "#PBS")
+        self.assertEqual(pbs_queue.get("q"), [pbs_queue_spec.attributes.queue_name])
+        self.assertEqual(pbs_queue.get("P"), [pbs_queue_spec.attributes.project_name])
+
+        pbs_reservation_spec = complete_spec(custom={})
+        pbs_reservation_spec.attributes.queue_name = None
+        pbs_reservation_spec.attributes.project_name = None
+        pbs_reservation = parsed_scheduler_options(
+            render_all(pbs_reservation_spec)["pbs"], "#PBS")
+        self.assertEqual(
+            pbs_reservation.get("q"),
+            [pbs_reservation_spec.attributes.reservation_id],
+        )
+
+        lsf = parsed_scheduler_options(scripts["lsf"], "#BSUB")
+        self.assertEqual(lsf.get("q"), [spec.attributes.queue_name])
+        self.assertEqual(lsf.get("G"), [spec.attributes.project_name])
+        self.assertEqual(lsf.get("P"), [spec.attributes.project_name])
+        self.assertEqual(lsf.get("U"), [spec.attributes.reservation_id])
+
+    def test_random_scheduler_custom_attributes_do_not_cross_leak(self) -> None:
         suffix = secrets.token_hex(5)
         keys = {
             "slurm": f"flag{secrets.token_hex(3)}",
@@ -1456,29 +1560,24 @@ class BatchRenderingTests(unittest.TestCase):
         values = {name: f"value-{name}-{suffix}" for name in keys}
         custom = {f"{name}.{keys[name]}": values[name] for name in keys}
         spec = complete_spec(custom=custom)
+        spec.attributes.queue_name = None
+        spec.attributes.project_name = None
+        spec.attributes.reservation_id = None
         scripts = render_all(spec)
 
-        self.assertIn(f'#SBATCH --partition="{spec.attributes.queue_name}"', scripts["slurm"])
-        self.assertIn(f'#SBATCH --account="{spec.attributes.project_name}"', scripts["slurm"])
-        self.assertIn(f'#SBATCH --reservation="{spec.attributes.reservation_id}"', scripts["slurm"])
-        self.assertIn(f'#SBATCH --{keys["slurm"]}="{values["slurm"]}"', scripts["slurm"])
-
-        pbs_directives = parsed_directives(scripts["pbs"], "#PBS")
-        self.assertIn(("-q", spec.attributes.queue_name), pbs_directives)
-        self.assertIn(("-P", spec.attributes.project_name), pbs_directives)
-        self.assertIn(("-q", spec.attributes.reservation_id), pbs_directives)
-        self.assertIn((f'-{keys["pbs"]}', values["pbs"]), pbs_directives)
-
-        self.assertIn(f'#BSUB -q "{spec.attributes.queue_name}"', scripts["lsf"])
-        self.assertIn(f'#BSUB -G "{spec.attributes.project_name}"', scripts["lsf"])
-        self.assertIn(f'#BSUB -P "{spec.attributes.project_name}"', scripts["lsf"])
-        self.assertIn(f'#BSUB -U "{spec.attributes.reservation_id}"', scripts["lsf"])
-        self.assertIn(f'#BSUB -{keys["lsf"]} "{values["lsf"]}"', scripts["lsf"])
-
+        prefixes = {"slurm": "#SBATCH", "pbs": "#PBS", "lsf": "#BSUB"}
         for scheduler, script in scripts.items():
+            options = parsed_scheduler_options(script, prefixes[scheduler])
+            self.assertEqual(options.get(keys[scheduler]), [values[scheduler]])
+            rendered_values = {
+                value
+                for option_values in options.values()
+                for value in option_values
+                if value is not None
+            }
             for other, value in values.items():
                 if other != scheduler:
-                    self.assertNotIn(value, script)
+                    self.assertNotIn(value, rendered_values)
 
     def test_invalid_scheduler_custom_attribute_names_and_values_are_rejected(self) -> None:
         cases = (
@@ -1512,11 +1611,20 @@ class BatchRenderingTests(unittest.TestCase):
             restored = Import().load(str(path))
         assert isinstance(restored, JobSpec)
         scripts = render_all(restored)
-        self.assertIn(f'#SBATCH --constraint="{marker}"', scripts["slurm"])
-        self.assertIn(f'#PBS -place "{marker}"', scripts["pbs"])
-        self.assertIn(f'#BSUB -spool "{marker}"', scripts["lsf"])
         self.assertEqual(
-            parse_hms(directive_value(scripts["pbs"], r"^#PBS -l walltime=([^\s]+)$"), False),
+            parsed_scheduler_options(scripts["slurm"], "#SBATCH").get("constraint"),
+            [marker],
+        )
+        self.assertEqual(
+            parsed_scheduler_options(scripts["pbs"], "#PBS").get("place"),
+            [marker],
+        )
+        self.assertEqual(
+            parsed_scheduler_options(scripts["lsf"], "#BSUB").get("spool"),
+            [marker],
+        )
+        self.assertEqual(
+            parse_hms(single_option_value(scripts["pbs"], "#PBS", "l:walltime"), False),
             int(duration.total_seconds()),
         )
 

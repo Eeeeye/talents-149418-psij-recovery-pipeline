@@ -126,6 +126,12 @@ Built-in attributes use these native mappings:
 | PBS Pro | `-q` | `-P` | `-q` (PBS reservations are reservation queues) |
 | LSF | `-q` | both `-G` and `-P` | `-U` |
 
+PBS Pro exposes one `-q` queue selector. The `queue_name` and
+`reservation_id` mappings are verified independently: when a specification
+sets only one of them, that value must be the single `-q` value. This contract
+does not prescribe precedence or duplicate-directive behavior for a
+specification that sets both fields at once.
+
 Scheduler-qualified custom attributes have the form `<scheduler>.<key>`.
 Render only the attributes belonging to the current scheduler, using its
 native directive form:
