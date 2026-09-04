@@ -14,8 +14,7 @@ documentation](https://exaworks.org/psij-python/#docs).
 
 ## Introduction
 
-1. [Quick Start Guide](QuickStart.md)
-2. [Workflow Examples](scripts/WORKFLOW-EXAMPLES.md)
-3. [Setting up Tests](README-testing.md)
-4. [How to Contribute](CONTRIBUTING.md)
-5. [Building the Documentation](README-dev.md)
+This exercise contains a focused source snapshot, not the full upstream
+documentation tree. The bundled [Quick Start Guide](QuickStart.md) provides
+upstream background; the exercise environment is already installed. Follow the
+task instruction for the repair scope and local verification commands.
