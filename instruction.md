@@ -221,6 +221,13 @@ When a later poll has finalized the last remaining attachment for that native
 ID, remove its completion record and per-ID tracking. Never perform that
 cleanup while any late attachment still needs the evidence.
 
+Completion-file cleanup and same-ID registration must have a consistent
+retirement boundary. Registration may wait for an already-started cleanup to
+finish, but a registration that completes before file deletion must not lose
+its evidence to that cleanup. This includes the interval after the old
+snapshot's last job has been removed from tracking and before its completion
+files are deleted.
+
 ### 7. Delayed and malformed completion evidence
 
 The existing batch-executor configuration exposes a completion grace period in

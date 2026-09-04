@@ -1042,6 +1042,78 @@ class RecoveryConcurrencyTests(unittest.TestCase):
             self.assertNotIn(native_id, executor._queue_poll_thread._jobs)
             self.assertFalse((executor.work_directory / f"{native_id}.ec").exists())
 
+    def test_cleanup_does_not_erase_acknowledged_late_registration(self) -> None:
+        """Pause a file removal while another thread attempts same-ID registration.
+
+        Accept either retained evidence or registration serialized after cleanup;
+        do not require a particular locking algorithm or retirement helper.
+        """
+        with tempfile.TemporaryDirectory(prefix="psij-retirement-race-") as td:
+            executor = _OfflineRecoveryExecutor(Path(td))
+            executor.work_directory.mkdir(parents=True)
+            native_id = token("native-")
+            record = executor.work_directory / f"{native_id}.ec"
+            record.write_bytes(b"0\n")
+            first = _register_recovered_job(executor, native_id)
+            begin_registration = threading.Event()
+            registered = threading.Event()
+            late: list[Job] = []
+            errors: list[BaseException] = []
+            removal_observed = False
+            registered_before_removal = False
+            original_unlink = os.unlink
+            original_remove = os.remove
+            original_path_unlink = Path.unlink
+
+            def register_late() -> None:
+                if not begin_registration.wait(5):
+                    return
+                try:
+                    late.append(_register_recovered_job(executor, native_id))
+                    registered.set()
+                except BaseException as error:
+                    errors.append(error)
+
+            def guarded_removal(original: object, path: object,
+                                *args: object, **kwargs: object) -> object:
+                nonlocal removal_observed, registered_before_removal
+                target = os.fsdecode(path)
+                is_record = (target == str(record) or
+                             (target == record.name and kwargs.get("dir_fd") is not None))
+                if is_record and not removal_observed:
+                    removal_observed = True
+                    begin_registration.set()
+                    registered_before_removal = registered.wait(1)
+                return original(path, *args, **kwargs)
+
+            worker = threading.Thread(target=register_late, daemon=True)
+            worker.start()
+            try:
+                with patch("os.unlink", lambda path, *a, **kw:
+                           guarded_removal(original_unlink, path, *a, **kw)), \
+                     patch("os.remove", lambda path, *a, **kw:
+                           guarded_removal(original_remove, path, *a, **kw)), \
+                     patch.object(Path, "unlink", lambda path, *a, **kw:
+                                  guarded_removal(original_path_unlink, path, *a, **kw)):
+                    executor._queue_poll_thread._poll()
+            finally:
+                begin_registration.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive(), "same-ID registration did not return")
+            self.assertFalse(errors, repr(errors))
+            self.assertEqual(first.status.state, JobState.COMPLETED)
+            self.assertEqual(first.status.exit_code, 0)
+            self.assertEqual(len(late), 1)
+            if registered_before_removal:
+                self.assertTrue(record.is_file(),
+                                "cleanup erased evidence after late registration returned")
+                self.assertEqual(late[0].status.state, JobState.ACTIVE)
+                executor._queue_poll_thread._poll()
+                self.assertEqual(late[0].status.state, JobState.COMPLETED)
+                self.assertEqual(late[0].status.exit_code, 0)
+                self.assertNotIn(native_id, executor._queue_poll_thread._jobs)
+                self.assertFalse(record.exists())
+
     def test_completion_grace_period_requires_positive_finite_number(self) -> None:
         for value in (0, -0.01, float("nan"), float("inf"), float("-inf")):
             with self.subTest(value=value), self.assertRaises(ValueError):

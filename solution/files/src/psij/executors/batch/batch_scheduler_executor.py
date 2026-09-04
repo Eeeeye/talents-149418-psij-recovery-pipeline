@@ -709,8 +709,11 @@ class _QueuePollThread(Thread):
                                            metadata=status.metadata)
                     executor._set_job_status(job, job_status, completion_evidence_checked)
                 if status.state.final:
-                    if self._remove_snapshot_jobs(native_id, job_list):
-                        executor._delete_completion_files(native_id)
+                    # Registration and final evidence deletion share one retirement boundary.
+                    # Releasing this lock between them can erase a newly attached job's record.
+                    with self._jobs_lock:
+                        if self._remove_snapshot_jobs(native_id, job_list):
+                            executor._delete_completion_files(native_id)
         except Exception as ex:
             msg = traceback.format_exc()
             self._handle_poll_error(executor, True, ex,
