@@ -661,14 +661,23 @@ print(json.dumps({
         invalid_documents = {
             "array-envelope": [],
             "null-envelope": None,
+            "boolean-envelope": True,
+            "number-envelope": 0.1,
+            "string-envelope": "JobSpec",
             "missing-version": {"type": "JobSpec", "data": valid_data},
-            "boolean-version": {"version": True, "type": "JobSpec", "data": valid_data},
-            "string-version": {"version": "0.1", "type": "JobSpec", "data": valid_data},
-            "null-type": {"version": 0.1, "type": None, "data": valid_data},
-            "numeric-type": {"version": 0.1, "type": 1, "data": valid_data},
+            "missing-type": {"version": 0.1, "data": valid_data},
             "missing-data": {"version": 0.1, "type": "JobSpec"},
-            "null-data": {"version": 0.1, "type": "JobSpec", "data": None},
         }
+        invalid_member_values = {
+            "version": (None, False, True, "0.1", [], {}, 0, 1),
+            "type": (None, False, True, 0.1, [], {}, "Other"),
+            "data": (None, False, True, 0.1, "{}", []),
+        }
+        for member, values in invalid_member_values.items():
+            for index, value in enumerate(values):
+                document = {"version": 0.1, "type": "JobSpec", "data": valid_data}
+                document[member] = value
+                invalid_documents[f"{member}-kind-{index}"] = document
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "invalid-envelope.json"
             for label, document in invalid_documents.items():
@@ -1849,6 +1858,23 @@ class LauncherClassificationTests(unittest.TestCase):
         message = self.launcher.get_launcher_failure_message(output)
         self.assertIn("same-line-prefix-", message)
         self.assertIn("_PSI_J_LAUNCHER_DONE", message)
+
+    def test_failure_filter_removes_only_complete_marker_lines(self) -> None:
+        marker = "_PSI_J_LAUNCHER_DONE"
+        diagnostic = token("diagnostic-")
+        prefixed = token("prefix-") + marker
+        partial = "_PSI_J_LAUNCHER_DON"
+        for newline in ("\n", "\r\n"):
+            output = newline.join(
+                (marker, diagnostic, marker, prefixed, partial, marker)
+            )  # The final full marker is deliberately unterminated.
+            with self.subTest(newline=repr(newline)):
+                self.assertTrue(self.launcher.is_launcher_failure(output))
+                message = self.launcher.get_launcher_failure_message(output)
+                self.assertIn(diagnostic, message)
+                self.assertIn(prefixed, message)
+                self.assertIn(partial, message)
+                self.assertEqual(message.count(marker), 2)
 
     def test_unterminated_complete_marker_remains_failure_evidence(self) -> None:
         output = "_PSI_J_LAUNCHER_DONE"

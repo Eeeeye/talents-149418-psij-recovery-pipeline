@@ -78,13 +78,17 @@ custom-attribute value, including inside a nested list or object. Reject those
 values during both export and import rather than accepting Python's
 non-standard JSON extensions.
 
-The on-disk document remains a JSON envelope with required `version`, `type`,
-and `data` members. Their JSON kinds are exact: `version` is a number (a JSON
-boolean is not a number here), `type` is a string, and `data` is an object.
-Omitting any of those three members is invalid; `true` and `false` must be
-rejected as envelope versions, and `null` must be rejected as envelope data.
-The existing loader must continue to read version `0.1`, type `JobSpec`
-manifests such as `examples/legacy-job-v0.1.json`.
+The on-disk document is a JSON object with all three members below. Missing
+members and incorrect JSON kinds are rejected without coercion, with
+`ValueError` or `TypeError`:
+
+| Member | Accepted value | Rejected values |
+| --- | --- | --- |
+| `version` | JSON number `0.1` | null, booleans, strings (including `"0.1"`), arrays, objects, and any other number |
+| `type` | JSON string `"JobSpec"` | null, booleans, numbers, arrays, objects, and any other string |
+| `data` | JSON object | null, booleans, numbers, strings, and arrays |
+
+The existing loader must continue to read `examples/legacy-job-v0.1.json`.
 
 Within `data`, `arguments` is an array or null; `inherit_environment` is a
 boolean; `environment` is an object with string keys and values or null; path
@@ -184,9 +188,12 @@ Do not change the state transition order or callback behavior.
 For script-based launchers, `_PSI_J_LAUNCHER_DONE` is a successful launcher
 completion marker only when it is the exact final logical line and is followed
 by a normal LF or CRLF line ending. Earlier diagnostic lines are allowed.
-Trailing non-empty output, a partial marker, or no marker is a launcher
-failure. Launcher failure messages must retain the useful diagnostic text and
-must not report the valid completion marker itself as an error.
+The absence of such a final marker is a launcher failure; a blank line after
+the last marker also fails. Completion classification and failure-message filtering
+are separate rules: when deriving a failure message, omit every exact
+marker-only line terminated by LF or CRLF, including complete nonfinal marker
+lines. This filtering does not turn a nonfinal marker into successful
+completion. Retain all other useful diagnostic content.
 
 A same-line prefix before `_PSI_J_LAUNCHER_DONE` means that logical line is not
 the exact marker. Likewise, the complete marker text without a terminating LF
