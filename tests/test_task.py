@@ -881,7 +881,7 @@ class RecoveryConcurrencyTests(unittest.TestCase):
     def test_delayed_completion_record_does_not_create_false_success(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-delayed-ec-") as td:
             executor = _OfflineRecoveryExecutor(Path(td), completion_grace_period=1.0)
-            executor.work_directory.mkdir(parents=True)
+            executor.work_directory.mkdir(parents=True, exist_ok=True)
             native_id = token("native-")
             job = _register_recovered_job(executor, native_id)
             record = executor.work_directory / f"{native_id}.ec"
@@ -940,7 +940,7 @@ class RecoveryConcurrencyTests(unittest.TestCase):
             grace_period = 0.12
             executor = _OfflineRecoveryExecutor(
                 Path(td), completion_grace_period=grace_period)
-            executor.work_directory.mkdir(parents=True)
+            executor.work_directory.mkdir(parents=True, exist_ok=True)
             native_id = token("native-")
             job = _register_recovered_job(executor, native_id)
 
@@ -966,7 +966,7 @@ class RecoveryConcurrencyTests(unittest.TestCase):
     def test_present_scheduler_terminal_state_is_not_delayed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-present-terminal-") as td:
             executor = _OfflineRecoveryExecutor(Path(td))
-            executor.work_directory.mkdir(parents=True)
+            executor.work_directory.mkdir(parents=True, exist_ok=True)
             native_id = token("native-")
             job = _register_recovered_job(executor, native_id)
             executor.status_map[native_id] = JobStatus(JobState.COMPLETED)
@@ -984,7 +984,7 @@ class RecoveryConcurrencyTests(unittest.TestCase):
                     prefix=f"psij-{label}-") as td:
                 executor = _OfflineRecoveryExecutor(
                     Path(td), completion_grace_period=0.03)
-                executor.work_directory.mkdir(parents=True)
+                executor.work_directory.mkdir(parents=True, exist_ok=True)
                 native_id = token("native-")
                 job = _register_recovered_job(executor, native_id)
                 if contents is not None:
@@ -1004,7 +1004,7 @@ class RecoveryConcurrencyTests(unittest.TestCase):
     def _poll_while_attaching_same_native_id(
             self, root: Path) -> tuple[_OfflineRecoveryExecutor, str, Job, Job]:
         executor = _OfflineRecoveryExecutor(root)
-        executor.work_directory.mkdir(parents=True)
+        executor.work_directory.mkdir(parents=True, exist_ok=True)
         native_id = token("native-")
         (executor.work_directory / f"{native_id}.ec").write_text("0\n", encoding="ascii")
         first = _register_recovered_job(executor, native_id)
@@ -1050,7 +1050,7 @@ class RecoveryConcurrencyTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory(prefix="psij-retirement-race-") as td:
             executor = _OfflineRecoveryExecutor(Path(td))
-            executor.work_directory.mkdir(parents=True)
+            executor.work_directory.mkdir(parents=True, exist_ok=True)
             native_id = token("native-")
             record = executor.work_directory / f"{native_id}.ec"
             record.write_bytes(b"0\n")
@@ -1434,12 +1434,14 @@ class SchedulerStatusParsingTests(unittest.TestCase):
     def test_pbs_exit_status_requires_a_json_integer_when_present(self) -> None:
         pbs = object.__new__(PBSProJobExecutor)
         native_id = token("pbs-exit-schema-")
-        for value in (None, True, 7.5, "7", []):
-            payload = json.dumps({
-                "Jobs": {native_id: {"job_state": "R", "Exit_status": value}},
-            })
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                pbs.parse_status_output(0, payload)
+        for native_state in ("R", "F"):
+            for value in (None, True, False, 0.0, 7.0, 7.5, "7", [], {}):
+                payload = json.dumps({
+                    "Jobs": {native_id: {"job_state": native_state, "Exit_status": value}},
+                })
+                with self.subTest(native_state=native_state, value=value), \
+                        self.assertRaises(ValueError):
+                    pbs.parse_status_output(0, payload)
 
         valid = json.dumps({
             "Jobs": {native_id: {"job_state": "R", "Exit_status": 0}},

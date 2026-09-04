@@ -262,8 +262,11 @@ A scheduler row that is still present retains its reported PSI/J status.
   and structurally malformed rows raise `ValueError`.
 - PBS Pro JSON may omit the optional `comment` member; its message is then
   `None`. The top-level document and `Jobs` member are objects; each job entry
-  is an object with a string `job_state`, while optional `Exit_status` is an
-  integer and optional `comment` is a string or null. For native states that
+  is an object with a string `job_state`. If present, `Exit_status` must be a
+  JSON integer: reject null, booleans, floats (including integral-valued floats
+  such as `0.0`), strings, arrays, and objects with `ValueError`. This type
+  validation applies to non-final native states as well as final ones.
+  Optional `comment` is a string or null. For native states that
   map to `COMPLETED`, an absent or zero `Exit_status` remains `COMPLETED`, value
   `265` maps to `CANCELED`, and every other non-zero value maps to `FAILED`.
   An `Exit_status` on a non-final native state does not make it final.
