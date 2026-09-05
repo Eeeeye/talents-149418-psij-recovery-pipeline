@@ -38,6 +38,7 @@ from psij import (  # noqa: E402
     JobStatus,
     InvalidJobException,
     ResourceSpecV1,
+    SubmitException,
 )
 from psij.executors.batch.batch_scheduler_executor import (  # noqa: E402
     BatchSchedulerExecutor,
@@ -48,6 +49,7 @@ from psij.executors.batch.lsf import LsfExecutorConfig, LsfJobExecutor  # noqa: 
 from psij.executors.batch.pbspro import PBSProExecutorConfig, PBSProJobExecutor  # noqa: E402
 from psij.executors.batch.slurm import SlurmExecutorConfig, SlurmJobExecutor  # noqa: E402
 from psij.launchers.single import SingleLauncher  # noqa: E402
+import psutil  # noqa: E402
 
 
 def _run_local_job_after_fork(connection: object) -> None:
@@ -75,8 +77,10 @@ class _OfflineRecoveryExecutor(BatchSchedulerExecutor):
     _NAME_ = "offline-recovery"
 
     def __init__(self, root: Path, *, completion_grace_period: float = 1.0,
+                 queue_polling_error_threshold: int = 2,
                  start_background: bool = False) -> None:
         self.status_map: Dict[str, JobStatus] = {}
+        self.parse_error = False
         self.poll_started: threading.Event | None = None
         self.poll_release: threading.Event | None = None
         self._start_background = start_background
@@ -84,6 +88,7 @@ class _OfflineRecoveryExecutor(BatchSchedulerExecutor):
             work_directory=root,
             queue_polling_interval=0.02,
             initial_queue_polling_delay=0.0,
+            queue_polling_error_threshold=queue_polling_error_threshold,
             completion_grace_period=completion_grace_period,
         )
         super().__init__(config=config)
@@ -123,7 +128,66 @@ class _OfflineRecoveryExecutor(BatchSchedulerExecutor):
     def parse_status_output(self, exit_code: int, out: str) -> Dict[str, JobStatus]:
         if exit_code != 0:
             raise RuntimeError(out)
+        if self.parse_error:
+            raise ValueError("synthetic malformed scheduler status")
         return dict(self.status_map)
+
+
+class _SubmissionProbeExecutor(BatchSchedulerExecutor):
+    """A scheduler-free submitter for publication and rollback tests."""
+
+    _NAME_ = "offline-submission"
+
+    def __init__(self, root: Path, mode: str, *, keep_files: bool = False) -> None:
+        self.mode = mode
+        self.expected_native_id = f"native-{secrets.token_hex(6)}"
+        super().__init__(config=BatchSchedulerExecutorConfig(
+            work_directory=root,
+            keep_files=keep_files,
+        ))
+
+    def _start_queue_poll_thread(self) -> _QueuePollThread:
+        return _QueuePollThread("offline submission poller", self.config, self)
+
+    def _create_script_context(self, job: Job) -> Dict[str, object]:
+        if self.mode == "context-error":
+            raise ValueError("synthetic submit-context failure")
+        return {"job": job}
+
+    def generate_submit_script(self, job: Job, context: Dict[str, object],
+                               submit_file: object) -> None:
+        if self.mode == "script-error":
+            raise RuntimeError("synthetic submit-script failure")
+        submit_file.write("#!/bin/sh\n")  # type: ignore[attr-defined]
+
+    def get_submit_command(self, job: Job, submit_file_path: Path) -> list[str]:
+        return ["offline-submit", str(submit_file_path)]
+
+    def job_id_from_submit_output(self, out: str) -> str:
+        if self.mode == "empty-native-id":
+            return ""
+        if self.mode == "whitespace-native-id":
+            return " \t "
+        if self.mode == "non-string-native-id":
+            return None  # type: ignore[return-value]
+        return self.expected_native_id
+
+    def get_cancel_command(self, native_id: str) -> list[str]:
+        return ["offline-cancel", native_id]
+
+    def process_cancel_command_output(self, exit_code: int, out: str) -> None:
+        raise SubmitException(out)
+
+    def get_status_command(self, native_ids: Iterable[str]) -> list[str]:
+        return ["offline-status", *native_ids]
+
+    def parse_status_output(self, exit_code: int, out: str) -> Dict[str, JobStatus]:
+        return {}
+
+    def _run_command(self, cmd: list[str]) -> str:
+        if self.mode == "command-error":
+            raise subprocess.CalledProcessError(73, cmd, output="scheduler unavailable")
+        return "accepted"
 
 
 def _register_recovered_job(executor: _OfflineRecoveryExecutor, native_id: str) -> Job:
@@ -832,6 +896,412 @@ class PreservedBehaviorTests(unittest.TestCase):
             output = (root / "stdout.log").read_text(encoding="utf-8")
             self.assertIn(f"ONLY_TEST_VALUE={marker}", output)
             self.assertNotIn("PYTHONPATH=", output)
+
+
+class SubmissionLifecycleTests(unittest.TestCase):
+    def test_invalid_specification_is_rejected_before_binding_or_callbacks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-invalid-submit-") as td:
+            targets = (
+                JobExecutor.get_instance("local"),
+                _SubmissionProbeExecutor(Path(td), "success"),
+            )
+            for target in targets:
+                with self.subTest(target=type(target).__name__):
+                    observed: list[JobState] = []
+                    job = Job()
+                    job.set_job_status_callback(
+                        lambda _job, status: observed.append(status.state))
+
+                    with self.assertRaises(InvalidJobException):
+                        target.submit(job)
+                    self.assertEqual(job.status.state, JobState.NEW)
+                    self.assertIsNone(job.executor)
+                    self.assertIsNone(job.native_id)
+                    self.assertEqual(observed, [])
+
+    def test_submit_rejects_preassociated_new_jobs_without_stealing_them(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-associated-submit-") as td:
+            root = Path(td)
+            owner = _SubmissionProbeExecutor(root / "owner", "success")
+            targets = (
+                JobExecutor.get_instance("local"),
+                _SubmissionProbeExecutor(root / "target", "success"),
+            )
+            for target in targets:
+                with self.subTest(target=type(target).__name__):
+                    observed: list[JobState] = []
+                    job = Job(JobSpec(executable="/bin/true", launcher="single"))
+                    job.executor = owner
+                    job._native_id = "existing-native-id"
+                    job.set_job_status_callback(
+                        lambda _job, status: observed.append(status.state))
+
+                    with self.assertRaises(InvalidJobException):
+                        target.submit(job)
+                    self.assertEqual(job.status.state, JobState.NEW)
+                    self.assertIs(job.executor, owner)
+                    self.assertEqual(job.native_id, "existing-native-id")
+                    self.assertEqual(observed, [])
+
+    def test_failed_local_spawn_is_atomic_and_the_same_job_can_retry(self) -> None:
+        observed: list[JobState] = []
+        executor = JobExecutor.get_instance("local")
+        with tempfile.TemporaryDirectory(prefix="psij-local-retry-") as td:
+            root = Path(td)
+            spec = JobSpec(
+                executable="/bin/true",
+                directory=root / f"missing-{secrets.token_hex(5)}",
+                launcher="single",
+            )
+            job = Job(spec)
+            job.set_job_status_callback(lambda _job, status: observed.append(status.state))
+
+            with self.assertRaises(SubmitException):
+                executor.submit(job)
+            self.assertEqual(job.status.state, JobState.NEW)
+            self.assertIsNone(job.executor)
+            self.assertIsNone(job.native_id)
+            self.assertEqual(observed, [])
+
+            spec.directory = root
+            executor.submit(job)
+            status = job.wait(timeout=timedelta(seconds=5))
+            self.assertIsNotNone(status)
+            assert status is not None
+            self.assertEqual(status.state, JobState.COMPLETED)
+            self.assertEqual(status.exit_code, 0)
+            self.assertIs(job.executor, executor)
+            self.assertIsNotNone(job.native_id)
+
+    def test_failed_local_launcher_setup_is_atomic_and_retryable(self) -> None:
+        observed: list[JobState] = []
+        executor = JobExecutor.get_instance("local")
+        job = Job(JobSpec(
+            executable="/bin/true",
+            launcher=f"missing-launcher-{secrets.token_hex(6)}",
+        ))
+        job.set_job_status_callback(
+            lambda _job, status: observed.append(status.state))
+
+        with self.assertRaises((SubmitException, InvalidJobException, ValueError)):
+            executor.submit(job)
+        self.assertEqual(job.status.state, JobState.NEW)
+        self.assertIsNone(job.executor)
+        self.assertIsNone(job.native_id)
+        self.assertEqual(observed, [])
+
+        assert job.spec is not None
+        job.spec.launcher = "single"
+        executor.submit(job)
+        status = job.wait(timeout=timedelta(seconds=5))
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertEqual(status.state, JobState.COMPLETED)
+
+    def test_invalid_local_attachment_is_atomic(self) -> None:
+        executor = JobExecutor.get_instance("local")
+        job = Job()
+        invalid_native_id = f"not-a-pid-{secrets.token_hex(6)}"
+        with self.assertRaises((InvalidJobException, SubmitException, ValueError)):
+            executor.attach(job, invalid_native_id)
+        self.assertEqual(job.status.state, JobState.NEW)
+        self.assertIsNone(job.executor)
+        self.assertIsNone(job.native_id)
+
+        missing_job = Job()
+        with self.assertRaises(psutil.NoSuchProcess):
+            executor.attach(missing_job, str(2 ** 31 - 1))
+        self.assertEqual(missing_job.status.state, JobState.NEW)
+        self.assertIsNone(missing_job.executor)
+        self.assertIsNone(missing_job.native_id)
+
+    def test_local_attachment_cannot_steal_an_existing_owner(self) -> None:
+        owner = JobExecutor.get_instance("local")
+        target = JobExecutor.get_instance("local")
+        job = Job()
+        job.executor = owner
+        job._native_id = os.getpid()
+
+        with self.assertRaises(InvalidJobException):
+            target.attach(job, str(os.getpid()))
+
+        self.assertEqual(job.status.state, JobState.NEW)
+        self.assertIs(job.executor, owner)
+        self.assertEqual(job.native_id, str(os.getpid()))
+
+    def test_local_attachment_publishes_native_id_before_callbacks(self) -> None:
+        executor = JobExecutor.get_instance("local")
+        native_id = str(os.getpid())
+        observed: list[tuple[JobState, str | None]] = []
+        job = Job()
+        job.set_job_status_callback(
+            lambda current, status: observed.append((status.state, current.native_id)))
+
+        executor.attach(job, native_id)
+
+        self.assertEqual(job.status.state, JobState.ACTIVE)
+        self.assertEqual(job.native_id, native_id)
+        self.assertEqual(
+            observed,
+            [(JobState.QUEUED, native_id), (JobState.ACTIVE, native_id)],
+        )
+
+    def test_synchronous_reaping_never_publishes_a_missing_native_id(self) -> None:
+        class SynchronousReaper:
+            def __init__(self) -> None:
+                self._lock = threading.RLock()
+                self._jobs: Dict[Job, object] = {}
+
+            def register(self, entry: object) -> None:
+                current_job = entry.job  # type: ignore[attr-defined]
+                self._jobs[current_job] = entry
+                process = entry.process  # type: ignore[attr-defined]
+                process.wait(timeout=2)
+                entry.exit_code = 0  # type: ignore[attr-defined]
+                entry.done_time = time.time()  # type: ignore[attr-defined]
+                entry.out = None  # type: ignore[attr-defined]
+                entry.executor._process_done(entry)  # type: ignore[attr-defined]
+
+            def cancel(self, job: Job) -> None:
+                self._jobs[job].kill_flag = True  # type: ignore[attr-defined]
+
+        executor = JobExecutor.get_instance("local")
+        executor._reaper = SynchronousReaper()  # type: ignore[attr-defined]
+        observed: list[tuple[JobState, str | None]] = []
+        job = Job(JobSpec(executable="/bin/true", launcher="single"))
+        job.set_job_status_callback(
+            lambda current, status: observed.append((status.state, current.native_id)))
+
+        executor.submit(job)
+
+        self.assertEqual(job.status.state, JobState.COMPLETED)
+        self.assertIsNotNone(job.native_id)
+        self.assertTrue(observed)
+        self.assertTrue(all(native_id == job.native_id for _state, native_id in observed))
+
+    def test_local_cancel_rejects_a_foreign_executor_and_final_cancel_is_noop(self) -> None:
+        owner = JobExecutor.get_instance("local")
+        foreign = JobExecutor.get_instance("local")
+        self.assertIsNot(owner, foreign)
+        job = Job(JobSpec(
+            executable=sys.executable,
+            arguments=["-c", "import time; time.sleep(2)"],
+            launcher="single",
+        ))
+        owner.submit(job)
+        active = job.wait(
+            timeout=timedelta(seconds=2), target_states=JobState.ACTIVE)
+        self.assertIsNotNone(active)
+        self.assertEqual(job.status.state, JobState.ACTIVE)
+
+        with self.assertRaises(InvalidJobException):
+            foreign.cancel(job)
+        self.assertEqual(job.status.state, JobState.ACTIVE)
+        self.assertIs(job.executor, owner)
+
+        job.cancel()
+        canceled = job.wait(timeout=timedelta(seconds=2))
+        self.assertIsNotNone(canceled)
+        assert canceled is not None
+        self.assertEqual(canceled.state, JobState.CANCELED)
+
+        # Direct executor use follows the same final-state no-op rule as Job.cancel().
+        owner.cancel(job)
+        self.assertEqual(job.status.state, JobState.CANCELED)
+
+    def test_local_cancel_publication_shares_the_reaper_retirement_boundary(self) -> None:
+        class ObservingReaper:
+            def __init__(self) -> None:
+                self._lock = threading.RLock()
+                self.observed_state: JobState | None = None
+                self.observer: threading.Thread | None = None
+
+            def cancel(self, current: Job) -> None:
+                # A status-first implementation exposes CANCELED before cancellation is registered.
+                if current.status.state != JobState.ACTIVE:
+                    raise KeyError(current)
+
+                def observe_after_retirement_boundary() -> None:
+                    with self._lock:
+                        self.observed_state = current.status.state
+
+                self.observer = threading.Thread(target=observe_after_retirement_boundary)
+                self.observer.start()
+                # If the executor owns the same lock around cancel + status publication, the
+                # observer cannot cross the retirement boundary until CANCELED is visible.
+                time.sleep(0.05)
+
+        executor = JobExecutor.get_instance("local")
+        job = Job(JobSpec(executable="/bin/true", launcher="single"))
+        job.executor = executor
+        job._native_id = os.getpid()
+        job.status = JobStatus(JobState.ACTIVE)
+        reaper = ObservingReaper()
+        executor._reaper = reaper  # type: ignore[attr-defined]
+
+        executor.cancel(job)
+        assert reaper.observer is not None
+        reaper.observer.join(timeout=1)
+
+        self.assertFalse(reaper.observer.is_alive())
+        self.assertEqual(job.status.state, JobState.CANCELED)
+        self.assertEqual(reaper.observed_state, JobState.CANCELED)
+
+    def test_failed_batch_submit_is_atomic_and_retryable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-batch-retry-") as td:
+            executor = _SubmissionProbeExecutor(Path(td), "command-error")
+            observed: list[tuple[JobState, str | None]] = []
+            job = Job(JobSpec(executable="/bin/true", launcher="single"))
+            job.set_job_status_callback(
+                lambda current, status: observed.append((status.state, current.native_id)))
+            submit_file = executor.work_directory / f"{job.id}.job"
+
+            with self.assertRaises(SubmitException):
+                executor.submit(job)
+            self.assertEqual(job.status.state, JobState.NEW)
+            self.assertIsNone(job.executor)
+            self.assertIsNone(job.native_id)
+            self.assertEqual(observed, [])
+            self.assertFalse(submit_file.exists())
+
+            executor.mode = "success"
+            executor.submit(job)
+            self.assertEqual(job.status.state, JobState.QUEUED)
+            self.assertIs(job.executor, executor)
+            self.assertEqual(job.native_id, executor.expected_native_id)
+            self.assertEqual(observed, [(JobState.QUEUED, executor.expected_native_id)])
+
+    def test_failed_batch_context_or_script_generation_is_atomic_and_retryable(self) -> None:
+        for mode in ("context-error", "script-error"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(
+                    prefix="psij-batch-script-retry-") as td:
+                executor = _SubmissionProbeExecutor(Path(td), mode)
+                job = Job(JobSpec(executable="/bin/true", launcher="single"))
+                submit_file = executor.work_directory / f"{job.id}.job"
+
+                expected_error = ValueError if mode == "context-error" else RuntimeError
+                with self.assertRaises(expected_error):
+                    executor.submit(job)
+                self.assertEqual(job.status.state, JobState.NEW)
+                self.assertIsNone(job.executor)
+                self.assertIsNone(job.native_id)
+                self.assertFalse(submit_file.exists())
+
+                executor.mode = "success"
+                executor.submit(job)
+                self.assertEqual(job.status.state, JobState.QUEUED)
+                self.assertEqual(job.native_id, executor.expected_native_id)
+
+    def test_keep_files_retains_a_failed_batch_submit_script(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-batch-keep-") as td:
+            executor = _SubmissionProbeExecutor(
+                Path(td), "command-error", keep_files=True)
+            job = Job(JobSpec(executable="/bin/true", launcher="single"))
+            submit_file = executor.work_directory / f"{job.id}.job"
+
+            with self.assertRaises(SubmitException):
+                executor.submit(job)
+            self.assertEqual(job.status.state, JobState.NEW)
+            self.assertIsNone(job.executor)
+            self.assertIsNone(job.native_id)
+            self.assertTrue(submit_file.is_file())
+
+    def test_batch_submit_rejects_invalid_native_ids_without_publication(self) -> None:
+        modes = ("empty-native-id", "whitespace-native-id", "non-string-native-id")
+        for mode in modes:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(
+                    prefix="psij-invalid-native-") as td:
+                executor = _SubmissionProbeExecutor(Path(td), mode)
+                job = Job(JobSpec(executable="/bin/true", launcher="single"))
+                submit_file = executor.work_directory / f"{job.id}.job"
+                with self.assertRaises((InvalidJobException, SubmitException, TypeError, ValueError)):
+                    executor.submit(job)
+                self.assertEqual(job.status.state, JobState.NEW)
+                self.assertIsNone(job.executor)
+                self.assertIsNone(job.native_id)
+                self.assertFalse(submit_file.exists())
+
+    def test_batch_attachment_validates_before_binding_and_preserves_owner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-batch-attach-") as td:
+            root = Path(td)
+            first = _SubmissionProbeExecutor(root / "first", "success")
+            second = _SubmissionProbeExecutor(root / "second", "success")
+            for invalid in (None, "", " \t "):
+                with self.subTest(invalid=invalid):
+                    job = Job()
+                    with self.assertRaises((InvalidJobException, TypeError, ValueError)):
+                        first.attach(job, invalid)  # type: ignore[arg-type]
+                    self.assertEqual(job.status.state, JobState.NEW)
+                    self.assertIsNone(job.executor)
+                    self.assertIsNone(job.native_id)
+
+            job = Job(JobSpec(executable="/bin/true"))
+            native_id = f"attached-{secrets.token_hex(6)}"
+            first.attach(job, native_id)
+            self.assertIs(job.executor, first)
+            self.assertEqual(job.native_id, native_id)
+            with self.assertRaises(InvalidJobException):
+                second.attach(job, f"other-{secrets.token_hex(6)}")
+            self.assertIs(job.executor, first)
+            self.assertEqual(job.native_id, native_id)
+
+    def test_batch_attachment_publishes_native_id_before_polled_callbacks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-batch-attach-callback-") as td:
+            executor = _OfflineRecoveryExecutor(Path(td))
+            native_id = token("attached-")
+            observed: list[tuple[JobState, str | None]] = []
+            job = Job()
+            job.set_job_status_callback(
+                lambda current, status: observed.append((status.state, current.native_id)))
+
+            executor.attach(job, native_id)
+            executor.status_map[native_id] = JobStatus(JobState.ACTIVE)
+            executor._queue_poll_thread._poll()
+
+            self.assertEqual(job.status.state, JobState.ACTIVE)
+            self.assertTrue(observed)
+            self.assertTrue(all(value == native_id for _state, value in observed))
+
+    def test_parser_failures_accumulate_until_the_configured_threshold(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-poll-errors-") as td:
+            executor = _OfflineRecoveryExecutor(
+                Path(td), queue_polling_error_threshold=2)
+            native_id = token("native-")
+            job = _register_recovered_job(executor, native_id)
+            executor.parse_error = True
+
+            executor._queue_poll_thread._poll()
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.ACTIVE)
+            self.assertEqual(executor._queue_poll_thread._poll_error_count, 2)
+
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.FAILED)
+            self.assertIsNotNone(job.status.message)
+            self.assertNotIn(native_id, executor._queue_poll_thread._jobs)
+
+    def test_one_valid_poll_resets_the_complete_poll_error_streak(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="psij-poll-reset-") as td:
+            executor = _OfflineRecoveryExecutor(
+                Path(td), queue_polling_error_threshold=2)
+            native_id = token("native-")
+            job = _register_recovered_job(executor, native_id)
+            executor.parse_error = True
+            executor._queue_poll_thread._poll()
+            executor._queue_poll_thread._poll()
+            self.assertEqual(executor._queue_poll_thread._poll_error_count, 2)
+
+            executor.parse_error = False
+            executor.status_map[native_id] = JobStatus(JobState.ACTIVE)
+            executor._queue_poll_thread._poll()
+            self.assertEqual(executor._queue_poll_thread._poll_error_count, 0)
+
+            executor.parse_error = True
+            executor._queue_poll_thread._poll()
+            executor._queue_poll_thread._poll()
+            self.assertEqual(job.status.state, JobState.ACTIVE)
+            self.assertEqual(executor._queue_poll_thread._poll_error_count, 2)
+
 
 class RecoveryConcurrencyTests(unittest.TestCase):
     def test_fork_children_complete_process_local_jobs(self) -> None:

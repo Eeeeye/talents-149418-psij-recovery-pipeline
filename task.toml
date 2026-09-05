@@ -2,13 +2,13 @@ schema_version = "1.1"
 
 [task]
 name = "talents/psij-recovery-pipeline"
-description = "Repair PSI/J persistence, scheduler rendering, fork-safe local reaping, and race-safe recovered batch completion."
+description = "Repair PSI/J persistence, scheduler rendering, transactional job publication, fork-safe local reaping, and race-safe recovered batch completion."
 authors = []
 keywords = ["hpc", "psij", "batch-scheduler", "persistence", "recovery"]
 
 [metadata]
 difficulty = "expert"
-difficulty_explanation = "The repair crosses persistent JobSpec recovery, three scheduler dialects, asynchronous state ordering, launcher classification, process-local reapers after fork, weak-reference thread lifetime, in-flight same-ID attachment races, and delayed shared-filesystem completion evidence. These are more than five independent, complex failure chains whose correctness requires coordinated multi-module concurrency and parsing changes plus exact timeout and file-format boundaries."
+difficulty_explanation = "The repair crosses persistent JobSpec recovery, three scheduler dialects, asynchronous state ordering, launcher classification, atomic local and batch submit/attach rollback, native-ID publication before callbacks, cancellation ownership, whole-poll error streaks, process-local reapers after fork, weak-reference thread lifetime, in-flight same-ID attachment races, and delayed shared-filesystem completion evidence. These are more than five independent, complex failure chains whose correctness requires coordinated multi-module concurrency and parsing changes plus exact timeout, ownership, and file-format boundaries."
 category = "systems-engineering"
 
 [verifier]

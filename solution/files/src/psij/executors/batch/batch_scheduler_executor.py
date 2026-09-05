@@ -16,7 +16,7 @@ from .escape_functions import bash_escape
 from psij.launchers.script_based_launcher import ScriptBasedLauncher
 
 from psij import JobExecutor, JobExecutorConfig, Launcher, Job, SubmitException, \
-    JobStatus, JobState
+    InvalidJobException, JobStatus, JobState
 from psij.executors.batch.template_function_library import ALL as FUNCTION_LIBRARY
 
 
@@ -220,28 +220,61 @@ class BatchSchedulerExecutor(JobExecutor):
     def submit(self, job: Job) -> None:
         """See :func:`~psij.JobExecutor.submit`."""
         logger.info('Job %s: submitting', job.id)
+        if job.executor is not None:
+            raise InvalidJobException('Job is already associated with an executor')
         self._ensure_work_dir()
 
         self._check_job(job)
-
-        context = self._create_script_context(job)
-
-        # assumes job ids are unique
         submit_file_path = self.work_directory / (job.id + '.job')
-        with submit_file_path.open('w') as submit_file:
-            self.generate_submit_script(job, context, submit_file)
         try:
+            context = self._create_script_context(job)
+
+            # assumes job ids are unique
+            with submit_file_path.open('w') as submit_file:
+                self.generate_submit_script(job, context, submit_file)
             logger.debug('Job %s: running submit command', job.id)
             out = self._run_command(self.get_submit_command(job, submit_file_path))
             logger.debug('Job %s: submit command output: %s', job.id, out)
-            job._native_id = self.job_id_from_submit_output(out)
+            native_id = self.job_id_from_submit_output(out)
+            if not isinstance(native_id, str) or not native_id.strip():
+                raise SubmitException('Submit command returned an invalid native ID')
+            job._native_id = native_id
             logger.info('Job %s: native id: %s', job.id, job.native_id)
-            self._set_job_status(job, JobStatus(JobState.QUEUED,
-                                                metadata={'native_id': job.native_id}))
+            # Registration and QUEUED publication are atomic with respect to polling.  A zero-delay
+            # poll cannot finalize the job before callbacks can observe its stable native id.
+            with self._queue_poll_thread._jobs_lock:
+                self._queue_poll_thread.register_job(job)
+                self._set_job_status(job, JobStatus(JobState.QUEUED,
+                                                    metadata={'native_id': job.native_id}))
         except subprocess.CalledProcessError as ex:
+            self._rollback_failed_submit(job, submit_file_path)
             raise SubmitException(ex.output) from None
+        except Exception:
+            self._rollback_failed_submit(job, submit_file_path)
+            raise
 
-        self._queue_poll_thread.register_job(job)
+    def _rollback_failed_submit(self, job: Job, submit_file_path: Path) -> None:
+        """Restores the public Job object after an unpublished submission failure."""
+        if not self.config.keep_files:
+            try:
+                submit_file_path.unlink()
+            except FileNotFoundError:
+                pass
+        if job.status.state == JobState.NEW:
+            with self._queue_poll_thread._jobs_lock:
+                if job.status.state == JobState.NEW:
+                    for native_id, jobs in list(self._queue_poll_thread._jobs.items()):
+                        remaining = [registered for registered in jobs if registered is not job]
+                        if remaining:
+                            self._queue_poll_thread._jobs[native_id] = remaining
+                        else:
+                            del self._queue_poll_thread._jobs[native_id]
+            with job._status_cv:
+                if job.status.state != JobState.NEW:
+                    return
+                job._native_id = None
+                if job.executor is self:
+                    job.executor = None
 
     def _get_launcher_from_job(self, job: Job) -> Launcher:
         assert job.spec
@@ -289,9 +322,24 @@ class BatchSchedulerExecutor(JobExecutor):
         native_id
             The id of the batch scheduler job to attach to.
         """
-        job._native_id = native_id
-        job.executor = self
-        self._queue_poll_thread.register_job(job)
+        if job.status.state != JobState.NEW:
+            raise InvalidJobException('Job must be in the NEW state')
+        if job.executor is not None:
+            raise InvalidJobException('Job is already associated with an executor')
+        if not isinstance(native_id, str) or not native_id.strip():
+            raise InvalidJobException('Native ID must be a non-empty string')
+        try:
+            with self._queue_poll_thread._jobs_lock:
+                job._native_id = native_id
+                job.executor = self
+                self._queue_poll_thread.register_job(job)
+        except Exception:
+            with job._status_cv:
+                if job.status.state == JobState.NEW:
+                    job._native_id = None
+                    if job.executor is self:
+                        job.executor = None
+            raise
 
     @abstractmethod
     def generate_submit_script(self, job: Job, context: Dict[str, object],
@@ -681,7 +729,6 @@ class _QueuePollThread(Thread):
             return
         else:
             exit_code = 0
-            self._poll_error_count = 0
         logger.debug('Output from status command: %s', out)
         try:
             status_map = executor.parse_status_output(exit_code, out)
@@ -690,6 +737,7 @@ class _QueuePollThread(Thread):
                                     ex,
                                     f'Failed to poll for job status: {traceback.format_exc()}')
             return
+        self._poll_error_count = 0
         try:
             for native_id, job_list in jobs_copy.items():
                 try:
@@ -774,7 +822,8 @@ class _QueuePollThread(Thread):
                 # Internal errors are a bit different, since they could, in principle, occur
                 # after the last job was processed and removed from self._jobs; in practice,
                 # the code in _poll has the job removal from _jobs as the last possible step
-                assert len(self._jobs) > 0
+                if len(self._jobs) == 0:
+                    return
                 jobs_copy = dict(self._jobs)
                 self._jobs.clear()
                 self._missing_since.clear()

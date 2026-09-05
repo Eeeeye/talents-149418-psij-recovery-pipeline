@@ -6,6 +6,7 @@ import multiprocessing
 import io
 import json
 import os
+import subprocess
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -17,10 +18,12 @@ from psij import (
     Job,
     JobAttributes,
     JobExecutor,
+    JobExecutorConfig,
     JobSpec,
     JobState,
     JobStatus,
     ResourceSpecV1,
+    SubmitException,
 )
 from psij.executors.batch.batch_scheduler_executor import (
     BatchSchedulerExecutor,
@@ -54,10 +57,12 @@ class _RecoveryProbeExecutor(BatchSchedulerExecutor):
     _NAME_ = "recovery-probe"
 
     def __init__(self, root: Path) -> None:
+        self.parse_error = False
         config = BatchSchedulerExecutorConfig(
             work_directory=root,
             initial_queue_polling_delay=0,
             queue_polling_interval=1,
+            queue_polling_error_threshold=2,
             completion_grace_period=0.5,
         )
         super().__init__(config=config)
@@ -88,7 +93,53 @@ class _RecoveryProbeExecutor(BatchSchedulerExecutor):
         return ["probe-status", *native_ids]
 
     def parse_status_output(self, exit_code: int, out: str) -> Dict[str, JobStatus]:
+        if self.parse_error:
+            raise ValueError("synthetic malformed scheduler status")
         return {}
+
+
+class _SubmissionProbeExecutor(BatchSchedulerExecutor):
+    """Scheduler-free submitter used to expose publication rollback."""
+
+    _NAME_ = "submission-probe"
+
+    def __init__(self, root: Path) -> None:
+        self.fail_submit = True
+        self.expected_native_id = "probe-native-17"
+        super().__init__(config=BatchSchedulerExecutorConfig(work_directory=root))
+
+    def _start_queue_poll_thread(self) -> _QueuePollThread:
+        return _QueuePollThread("submission probe poller", self.config, self)
+
+    def _create_script_context(self, job: Job) -> Dict[str, object]:
+        return {"job": job}
+
+    def generate_submit_script(self, job: Job, context: Dict[str, object],
+                               submit_file: object) -> None:
+        submit_file.write("#!/bin/sh\n")  # type: ignore[attr-defined]
+
+    def get_submit_command(self, job: Job, submit_file_path: Path) -> list[str]:
+        return ["probe-submit", str(submit_file_path)]
+
+    def job_id_from_submit_output(self, out: str) -> str:
+        return self.expected_native_id
+
+    def get_cancel_command(self, native_id: str) -> list[str]:
+        return ["probe-cancel", native_id]
+
+    def process_cancel_command_output(self, exit_code: int, out: str) -> None:
+        return None
+
+    def get_status_command(self, native_ids: Collection[str]) -> list[str]:
+        return ["probe-status", *native_ids]
+
+    def parse_status_output(self, exit_code: int, out: str) -> Dict[str, JobStatus]:
+        return {}
+
+    def _run_command(self, cmd: list[str]) -> str:
+        if self.fail_submit:
+            raise subprocess.CalledProcessError(73, cmd, output="scheduler unavailable")
+        return "accepted"
 
 
 def make_spec() -> JobSpec:
@@ -251,11 +302,84 @@ def recovery_probe() -> None:
         print("delayed completion evidence avoided false success and then finalized")
 
 
+def lifecycle_probe() -> None:
+    """Exercise atomic submit publication and whole-poll error accounting."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        executor = JobExecutor.get_instance(
+            "local", config=JobExecutorConfig(work_directory=root / "launcher"))
+        observed: list[tuple[JobState, str | None]] = []
+        spec = JobSpec(
+            executable="/bin/true",
+            directory=root / "missing-directory",
+            launcher="single",
+        )
+        job = Job(spec)
+        job.set_job_status_callback(
+            lambda current, status: observed.append((status.state, current.native_id)))
+        try:
+            executor.submit(job)
+        except SubmitException:
+            pass
+        else:
+            raise AssertionError("local spawn in a missing directory unexpectedly succeeded")
+        assert job.status.state == JobState.NEW
+        assert job.executor is None
+        assert job.native_id is None
+        assert observed == []
+
+        spec.directory = root
+        executor.submit(job)
+        status = job.wait(timeout=timedelta(seconds=3))
+        assert status is not None and status.state == JobState.COMPLETED
+        assert status.exit_code == 0
+        assert job.native_id is not None
+        assert all(native_id == job.native_id for _state, native_id in observed)
+        print("local submit rollback allowed a clean retry with stable callback identity")
+
+        batch = _SubmissionProbeExecutor(root / "batch")
+        batch_job = Job(JobSpec(executable="/bin/true", launcher="single"))
+        submit_file = batch.work_directory / f"{batch_job.id}.job"
+        try:
+            batch.submit(batch_job)
+        except SubmitException:
+            pass
+        else:
+            raise AssertionError("synthetic failed batch command unexpectedly succeeded")
+        assert batch_job.status.state == JobState.NEW
+        assert batch_job.executor is None
+        assert batch_job.native_id is None
+        assert not submit_file.exists()
+        batch.fail_submit = False
+        batch.submit(batch_job)
+        assert batch_job.status.state == JobState.QUEUED
+        assert batch_job.native_id == batch.expected_native_id
+        print("batch submit rollback removed unpublished state and the stale submit file")
+
+        recovery = _RecoveryProbeExecutor(root / "poll")
+        native_id = "parse-error-17"
+        recovered = Job(JobSpec(executable="/bin/true", launcher="single"))
+        recovered._native_id = native_id
+        recovered.executor = recovery
+        recovered.status = JobStatus(JobState.ACTIVE)
+        recovery._queue_poll_thread.register_job(recovered)
+        recovery.parse_error = True
+        recovery._queue_poll_thread._poll()
+        recovery._queue_poll_thread._poll()
+        assert recovered.status.state == JobState.ACTIVE
+        assert recovery._queue_poll_thread._poll_error_count == 2
+        recovery._queue_poll_thread._poll()
+        assert recovered.status.state == JobState.FAILED
+        assert native_id not in recovery._queue_poll_thread._jobs
+        print("parser failures accumulated across complete polling attempts")
+
+
 PROBES = {
     "roundtrip": roundtrip_probe,
     "batch": batch_probe,
     "wait": wait_probe,
     "launcher": launcher_probe,
+    "lifecycle": lifecycle_probe,
     "recovery": recovery_probe,
 }
 

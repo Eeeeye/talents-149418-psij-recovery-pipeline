@@ -24,14 +24,16 @@ cd /workspace
 ./scripts/reproduce.sh
 ```
 
-The five independent probes currently fail. Depending on which probe runs,
+The six independent probes currently fail. Depending on which probe runs,
 you will see a serialization exception or recovered fields with the wrong
 types, missing/invalid scheduler directives, an
 `UnreachableStateException` for a job that has already advanced past the
 requested state, and a launcher completion marker classified as a launcher
 failure. The recovery probe also shows a fork child whose local job cannot be
 reaped and a recovered batch job that is finalized before its exit evidence
-is safely published.
+is safely published. The lifecycle probe shows failed submissions that leave
+jobs partially bound and scheduler-status parse failures whose error streak is
+incorrectly forgotten after every successful command invocation.
 
 The repository imports successfully and the basic health check already
 passes. This is a behavioral repair task, not a dependency-installation task.
@@ -295,6 +297,51 @@ parsing its payload and raise `RuntimeError` whose message names the failed
 command (`squeue`, `qstat`, or `bjobs`). PBS Pro and LSF reject malformed JSON,
 wrong container types, missing required members, and unknown native states
 with `ValueError`.
+
+### 9. Transactional submission, attachment, and polling recovery
+
+Local and batch submission are public state-publication transactions. A job
+passed to `submit` must still be `NEW` and must not already be associated with
+an executor. A pre-associated job is rejected with `InvalidJobException`
+without changing its owner, native ID, status, or callbacks.
+
+Before a successful submission is published, validation, launcher setup,
+process creation, batch-script generation, the scheduler command, and native-ID
+parsing may fail. Such a failure must leave the public `Job` in `NEW` with
+`executor` and `native_id` both `None`, and it must emit no status callback. A
+caller may correct a transient local preparation or spawn failure, or a batch
+submission-command failure, and retry the same `Job` object. When batch
+configuration has `keep_files=False`, an unpublished failure also removes the
+generated `<job-id>.job` file; `keep_files=True` retains the existing diagnostic
+file behavior. A successful batch submission requires a string native ID with
+at least one non-whitespace character.
+
+Attachment has the same ownership boundary. Both local and batch `attach`
+accept only an unbound `NEW` job. Invalid native IDs and failed local process
+lookups leave the job unbound and unchanged; one executor may not steal a job
+already attached to another. After attachment succeeds, every subsequent
+status observation sees the stable native ID.
+
+Successful local submission must make the process ID visible before the reaper
+can publish `QUEUED`, `ACTIVE`, or a terminal callback, including when a child
+exits during registration. Batch registration, native-ID publication, and its
+initial `QUEUED` status likewise share one polling boundary. A callback may
+therefore inspect `job.native_id` without observing `None` for a published job.
+
+Direct local cancellation through an executor is ownership-safe. An executor
+that does not own the job raises `InvalidJobException` without mutation, and
+cancelling an already final job through its owner is a no-op. For an active
+owned job, registering the cancellation with the reaper and publishing
+`CANCELED` share one retirement boundary.
+
+The batch poller's configurable error threshold counts consecutive *complete
+poll failures*. A successful status-command invocation followed by a parser
+exception is still one failed poll and must not reset the count. Only a cycle
+whose command and status parsing both succeed resets the streak. Parser
+failures may be retried through the configured threshold; when their count
+becomes greater than that threshold, all still-registered jobs fail with a
+diagnostic and are removed from polling. One fully valid intervening poll
+resets the streak before later failures are counted.
 
 ## Preserved behavior
 

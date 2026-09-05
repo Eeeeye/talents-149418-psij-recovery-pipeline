@@ -211,25 +211,47 @@ class LocalJobExecutor(JobExecutor):
 
         :param job: The job to be submitted.
         """
+        if job.executor is not None:
+            raise InvalidJobException('Job is already associated with an executor')
         spec = self._check_job(job)
 
-        p = _ChildProcessEntry(job, self, self._get_launcher(self._get_launcher_name(spec)))
-        assert p.launcher
-        args = p.launcher.get_launch_command(job)
-
+        p: Optional[_ChildProcessEntry] = None
         try:
+            p = _ChildProcessEntry(job, self, self._get_launcher(self._get_launcher_name(spec)))
+            assert p.launcher
+            args = p.launcher.get_launch_command(job)
             with job._status_cv:
                 if job.status.state == JobState.CANCELED:
                     raise SubmitException('Job canceled')
             logger.debug('Running %s,  out=%s, err=%s', args, spec.stdout_path, spec.stderr_path)
             p.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          close_fds=True, cwd=spec.directory, env=_get_env(spec))
-            self._reaper.register(p)
-            job._native_id = p.process.pid
-            self._set_job_status(job, JobStatus(JobState.QUEUED, time=time.time(),
-                                                metadata={'nativeId': job._native_id}))
-            self._set_job_status(job, JobStatus(JobState.ACTIVE, time=time.time()))
+            # Registering and publishing the job share the reaper's retirement boundary.  This
+            # prevents a very short process from being reported before its native id is visible,
+            # while also ensuring that a callback-triggered cancel can find the process entry.
+            with self._reaper._lock:
+                job._native_id = p.process.pid
+                self._reaper.register(p)
+                self._set_job_status(job, JobStatus(JobState.QUEUED, time=time.time(),
+                                                    metadata={'nativeId': job._native_id}))
+                self._set_job_status(job, JobStatus(JobState.ACTIVE, time=time.time()))
         except Exception as ex:
+            if p is not None and p.process is not None and job.status.state == JobState.NEW:
+                try:
+                    if p.process.poll() is None:
+                        p.kill()
+                    p.process.wait(timeout=1)
+                except Exception:
+                    # Submission rollback must restore the PSI/J object even when a child exits
+                    # between the failed publication step and process cleanup.
+                    pass
+            with job._status_cv:
+                if job.status.state == JobState.NEW:
+                    job._native_id = None
+                    if job.executor is self:
+                        job.executor = None
+            if isinstance(ex, SubmitException):
+                raise
             raise SubmitException('Failed to submit job', exception=ex)
 
     def cancel(self, job: Job) -> None:
@@ -238,8 +260,24 @@ class LocalJobExecutor(JobExecutor):
 
         :param job: The job to cancel.
         """
-        self._set_job_status(job, JobStatus(JobState.CANCELED))
-        self._reaper.cancel(job)
+        if job.executor is not self:
+            raise InvalidJobException('Job is associated with a different executor')
+        if job.status.state.final:
+            return
+        # Marking the process for termination and publishing CANCELED share the same retirement
+        # boundary.  Otherwise the reaper can remove a just-completed entry between those steps
+        # and a late cancellation may overwrite or misreport the observed terminal outcome.
+        with self._reaper._lock:
+            if job.status.state.final:
+                return
+            try:
+                self._reaper.cancel(job)
+            except KeyError as ex:
+                if job.status.state.final:
+                    return
+                raise SubmitException('Job is not registered with the local executor',
+                                      exception=ex)
+            self._set_job_status(job, JobStatus(JobState.CANCELED))
 
     def _process_done(self, p: _ProcessEntry) -> None:
         assert p.exit_code is not None
@@ -290,15 +328,30 @@ class LocalJobExecutor(JobExecutor):
         """
         if job.status.state != JobState.NEW:
             raise InvalidJobException('Job must be in the NEW state')
-        job.executor = self
+        if job.executor is not None:
+            raise InvalidJobException('Job is already associated with an executor')
         pid = int(native_id)
+        process = psutil.Process(pid)
+        entry = _AttachedProcessEntry(job, process, self)
 
-        self._reaper.register(_AttachedProcessEntry(job, psutil.Process(pid), self))
-        # We assume that the native_id above is a PID that was obtained at some point using
-        # list(). If so, the process is either still running or has completed. Either way, we must
-        # bring it up to ACTIVE state
-        self._set_job_status(job, JobStatus(JobState.QUEUED, time=time.time()))
-        self._set_job_status(job, JobStatus(JobState.ACTIVE, time=time.time()))
+        try:
+            with self._reaper._lock:
+                job.executor = self
+                job._native_id = pid
+                self._reaper.register(entry)
+                # We assume that the native_id above is a PID that was obtained at some point using
+                # list(). If so, the process is either still running or has completed. Either way,
+                # bring it up to ACTIVE state only after publishing the stable native id.
+                self._set_job_status(job, JobStatus(JobState.QUEUED, time=time.time(),
+                                                    metadata={'nativeId': job._native_id}))
+                self._set_job_status(job, JobStatus(JobState.ACTIVE, time=time.time()))
+        except Exception:
+            with job._status_cv:
+                if job.status.state == JobState.NEW:
+                    job._native_id = None
+                    if job.executor is self:
+                        job.executor = None
+            raise
 
     def _get_launcher_name(self, spec: JobSpec) -> str:
         if spec.launcher is None:
