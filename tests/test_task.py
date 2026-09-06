@@ -1114,23 +1114,32 @@ class SubmissionLifecycleTests(unittest.TestCase):
         class ObservingReaper:
             def __init__(self) -> None:
                 self._lock = threading.RLock()
-                self.observed_state: JobState | None = None
-                self.observer: threading.Thread | None = None
+                self.registered = False
+                self.observations: list[tuple[bool, JobState]] = []
+                self.observers: list[threading.Thread] = []
 
-            def cancel(self, current: Job) -> None:
-                # A status-first implementation exposes CANCELED before cancellation is registered.
-                if current.status.state != JobState.ACTIVE:
-                    raise KeyError(current)
+            def observe_boundary(self, current: Job) -> None:
+                started = threading.Event()
+                finished = threading.Event()
 
                 def observe_after_retirement_boundary() -> None:
+                    started.set()
                     with self._lock:
-                        self.observed_state = current.status.state
+                        self.observations.append((self.registered, current.status.state))
+                    finished.set()
 
-                self.observer = threading.Thread(target=observe_after_retirement_boundary)
-                self.observer.start()
-                # If the executor owns the same lock around cancel + status publication, the
-                # observer cannot cross the retirement boundary until CANCELED is visible.
-                time.sleep(0.05)
+                observer = threading.Thread(target=observe_after_retirement_boundary, daemon=True)
+                self.observers.append(observer)
+                observer.start()
+                started.wait(timeout=1)
+                # A free retirement boundary exposes an incomplete pair immediately. A shared
+                # boundary holds both observers until the pair is complete, in either order.
+                finished.wait(timeout=0.05)
+
+            def cancel(self, current: Job) -> None:
+                with self._lock:
+                    self.registered = True
+                self.observe_boundary(current)
 
         executor = JobExecutor.get_instance("local")
         job = Job(JobSpec(executable="/bin/true", launcher="single"))
@@ -1139,14 +1148,19 @@ class SubmissionLifecycleTests(unittest.TestCase):
         job.status = JobStatus(JobState.ACTIVE)
         reaper = ObservingReaper()
         executor._reaper = reaper  # type: ignore[attr-defined]
+        job.set_job_status_callback(
+            lambda current, status: reaper.observe_boundary(current)
+            if status.state == JobState.CANCELED else None)
 
         executor.cancel(job)
-        assert reaper.observer is not None
-        reaper.observer.join(timeout=1)
+        for observer in reaper.observers:
+            observer.join(timeout=1)
 
-        self.assertFalse(reaper.observer.is_alive())
+        self.assertTrue(reaper.observers)
+        self.assertTrue(all(not observer.is_alive() for observer in reaper.observers))
+        self.assertTrue(reaper.registered)
         self.assertEqual(job.status.state, JobState.CANCELED)
-        self.assertEqual(reaper.observed_state, JobState.CANCELED)
+        self.assertEqual(reaper.observations, [(True, JobState.CANCELED)] * 2)
 
     def test_failed_batch_submit_is_atomic_and_retryable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-batch-retry-") as td:
