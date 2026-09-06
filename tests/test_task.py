@@ -1048,14 +1048,9 @@ class SubmissionLifecycleTests(unittest.TestCase):
         )
 
     def test_synchronous_reaping_never_publishes_a_missing_native_id(self) -> None:
-        class SynchronousReaper:
-            def __init__(self) -> None:
-                self._lock = threading.RLock()
-                self._jobs: Dict[Job, object] = {}
-
-            def register(self, entry: object) -> None:
-                current_job = entry.job  # type: ignore[attr-defined]
-                self._jobs[current_job] = entry
+        class SynchronousRegistry(dict):
+            def __setitem__(self, current_job: Job, entry: object) -> None:
+                super().__setitem__(current_job, entry)
                 process = entry.process  # type: ignore[attr-defined]
                 process.wait(timeout=2)
                 entry.exit_code = 0  # type: ignore[attr-defined]
@@ -1063,17 +1058,32 @@ class SubmissionLifecycleTests(unittest.TestCase):
                 entry.out = None  # type: ignore[attr-defined]
                 entry.executor._process_done(entry)  # type: ignore[attr-defined]
 
+        class SynchronousReaper:
+            def __init__(self) -> None:
+                self._lock = threading.RLock()
+                self._jobs = SynchronousRegistry()
+
+            def register(self, entry: object) -> None:
+                with self._lock:
+                    self._jobs[entry.job] = entry  # type: ignore[attr-defined]
+
             def cancel(self, job: Job) -> None:
                 self._jobs[job].kill_flag = True  # type: ignore[attr-defined]
 
         executor = JobExecutor.get_instance("local")
-        executor._reaper = SynchronousReaper()  # type: ignore[attr-defined]
+        reaper_type = type(executor._reaper)  # type: ignore[attr-defined]
+        reaper = SynchronousReaper()
+        executor._reaper = reaper  # type: ignore[attr-defined]
         observed: list[tuple[JobState, str | None]] = []
         job = Job(JobSpec(executable="/bin/true", launcher="single"))
         job.set_job_status_callback(
             lambda current, status: observed.append((status.state, current.native_id)))
 
-        executor.submit(job)
+        # Re-fetching the process-local singleton or updating its existing registry
+        # directly is equivalent to retaining it and calling register(). Observe the
+        # publication boundary through either access path, not a particular call graph.
+        with patch.object(reaper_type, "get_instance", return_value=reaper):
+            executor.submit(job)
 
         self.assertEqual(job.status.state, JobState.COMPLETED)
         self.assertIsNotNone(job.native_id)
@@ -1114,7 +1124,7 @@ class SubmissionLifecycleTests(unittest.TestCase):
         class ObservingReaper:
             def __init__(self) -> None:
                 self._lock = threading.RLock()
-                self.registered = False
+                self._jobs: Dict[Job, object] = {}
                 self.observations: list[tuple[bool, JobState]] = []
                 self.observers: list[threading.Thread] = []
 
@@ -1125,7 +1135,8 @@ class SubmissionLifecycleTests(unittest.TestCase):
                 def observe_after_retirement_boundary() -> None:
                     started.set()
                     with self._lock:
-                        self.observations.append((self.registered, current.status.state))
+                        self.observations.append(
+                            (self._jobs[current].kill_flag, current.status.state))  # type: ignore[attr-defined]
                     finished.set()
 
                 observer = threading.Thread(target=observe_after_retirement_boundary, daemon=True)
@@ -1138,29 +1149,54 @@ class SubmissionLifecycleTests(unittest.TestCase):
 
             def cancel(self, current: Job) -> None:
                 with self._lock:
-                    self.registered = True
+                    self._jobs[current].kill_flag = True  # type: ignore[attr-defined]
+                # Also sample after the method's own lock has been released; only
+                # an outer publication boundary may hold this observer back.
                 self.observe_boundary(current)
 
+        class ObservedEntry:
+            def __init__(self, current: Job, reaper: ObservingReaper) -> None:
+                self.job = current
+                self.reaper = reaper
+                self._kill_flag = False
+
+            @property
+            def kill_flag(self) -> bool:
+                return self._kill_flag
+
+            @kill_flag.setter
+            def kill_flag(self, value: bool) -> None:
+                self._kill_flag = value
+                self.reaper.observe_boundary(self.job)
+
         executor = JobExecutor.get_instance("local")
+        reaper_type = type(executor._reaper)  # type: ignore[attr-defined]
         job = Job(JobSpec(executable="/bin/true", launcher="single"))
         job.executor = executor
         job._native_id = os.getpid()
         job.status = JobStatus(JobState.ACTIVE)
         reaper = ObservingReaper()
+        entry = ObservedEntry(job, reaper)
+        reaper._jobs[job] = entry
         executor._reaper = reaper  # type: ignore[attr-defined]
         job.set_job_status_callback(
             lambda current, status: reaper.observe_boundary(current)
             if status.state == JobState.CANCELED else None)
 
-        executor.cancel(job)
+        # A refreshed singleton and direct kill-flag update must exercise the same
+        # registered job and retirement observations as a call to reaper.cancel().
+        with patch.object(reaper_type, "get_instance", return_value=reaper):
+            executor.cancel(job)
         for observer in reaper.observers:
             observer.join(timeout=1)
 
         self.assertTrue(reaper.observers)
         self.assertTrue(all(not observer.is_alive() for observer in reaper.observers))
-        self.assertTrue(reaper.registered)
+        self.assertTrue(entry.kill_flag)
         self.assertEqual(job.status.state, JobState.CANCELED)
-        self.assertEqual(reaper.observations, [(True, JobState.CANCELED)] * 2)
+        self.assertGreaterEqual(len(reaper.observations), 2)
+        self.assertTrue(all(pair == (True, JobState.CANCELED)
+                            for pair in reaper.observations), reaper.observations)
 
     def test_failed_batch_submit_is_atomic_and_retryable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-batch-retry-") as td:
