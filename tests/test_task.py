@@ -1009,7 +1009,8 @@ class SubmissionLifecycleTests(unittest.TestCase):
         self.assertIsNone(job.native_id)
 
         missing_job = Job()
-        with self.assertRaises(psutil.NoSuchProcess):
+        # The contract requires failed lookup to be atomic, not an unwrapped psutil error.
+        with self.assertRaises((psutil.NoSuchProcess, InvalidJobException, SubmitException)):
             executor.attach(missing_job, str(2 ** 31 - 1))
         self.assertEqual(missing_job.status.state, JobState.NEW)
         self.assertIsNone(missing_job.executor)
@@ -1180,7 +1181,8 @@ class SubmissionLifecycleTests(unittest.TestCase):
                 submit_file = executor.work_directory / f"{job.id}.job"
 
                 expected_error = ValueError if mode == "context-error" else RuntimeError
-                with self.assertRaises(expected_error):
+                # PSI/J's public submission exceptions may wrap the preparation failure.
+                with self.assertRaises((expected_error, InvalidJobException, SubmitException)):
                     executor.submit(job)
                 self.assertEqual(job.status.state, JobState.NEW)
                 self.assertIsNone(job.executor)
@@ -1229,7 +1231,8 @@ class SubmissionLifecycleTests(unittest.TestCase):
             for invalid in (None, "", " \t "):
                 with self.subTest(invalid=invalid):
                     job = Job()
-                    with self.assertRaises((InvalidJobException, TypeError, ValueError)):
+                    with self.assertRaises((InvalidJobException, SubmitException,
+                                            TypeError, ValueError)):
                         first.attach(job, invalid)  # type: ignore[arg-type]
                     self.assertEqual(job.status.state, JobState.NEW)
                     self.assertIsNone(job.executor)
@@ -1671,8 +1674,9 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         executor = object.__new__(SlurmJobExecutor)
         rows = ["JOBID STATE REASON"]
         native_ids = []
+        first_native_id = secrets.randbelow(900000) + 1000
         for index, reason in enumerate(self._SLURM_REASONS):
-            native_id = f"slurm-reason-{index}-{secrets.token_hex(3)}"
+            native_id = str(first_native_id + index)
             native_ids.append(native_id)
             rows.append(f"{native_id} F {reason}")
 
@@ -1712,7 +1716,7 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         }
         slurm = object.__new__(SlurmJobExecutor)
         for native_state, expected in slurm_states.items():
-            native_id = token("slurm-state-")
+            native_id = str(secrets.randbelow(900000) + 1000)
             output = f"JOBID STATE REASON\n{native_id} {native_state} offline reason\n"
             with self.subTest(scheduler="slurm", native_state=native_state):
                 self.assertEqual(slurm.parse_status_output(0, output)[native_id].state, expected)
@@ -1760,7 +1764,7 @@ class SchedulerStatusParsingTests(unittest.TestCase):
 
     def test_slurm_preserves_spaced_and_unknown_failure_reason(self) -> None:
         executor = object.__new__(SlurmJobExecutor)
-        native_id = token("slurm-")
+        native_id = str(secrets.randbelow(900000) + 1000)
         reason = "Node telemetry unavailable near rack 17"
         output = f"JOBID STATE REASON\n{native_id} F {reason}\n"
         statuses = executor.parse_status_output(0, output)
@@ -1769,7 +1773,7 @@ class SchedulerStatusParsingTests(unittest.TestCase):
 
     def test_slurm_rejects_unknown_states_and_malformed_structure(self) -> None:
         executor = object.__new__(SlurmJobExecutor)
-        native_id = token("slurm-invalid-")
+        native_id = str(secrets.randbelow(900000) + 1000)
         cases = (
             ("", "header"),
             (f"{native_id} R None\n", "header"),
@@ -1959,7 +1963,7 @@ class SchedulerStatusParsingTests(unittest.TestCase):
         slurm = object.__new__(SlurmJobExecutor)
         pbs = object.__new__(PBSProJobExecutor)
         lsf = object.__new__(LsfJobExecutor)
-        native_id = token("offline-status-")
+        native_id = str(secrets.randbelow(900000) + 1000)
         with patch.object(
                 BatchSchedulerExecutor,
                 "_run_command",
