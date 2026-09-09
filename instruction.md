@@ -302,7 +302,9 @@ with `ValueError`.
 
 Local and batch submission are public state-publication transactions. A job
 passed to `submit` must still be `NEW` and must not already be associated with
-an executor. A pre-associated job is rejected with `InvalidJobException`
+an executor. `submit()` requires a non-null, valid `JobSpec`; a missing
+specification is rejected with `InvalidJobException` before binding or status
+publication. A pre-associated job is rejected with `InvalidJobException`
 without changing its owner, native ID, status, or callbacks.
 
 Before a successful submission is published, validation, launcher setup,
@@ -316,11 +318,15 @@ generated `<job-id>.job` file; `keep_files=True` retains the existing diagnostic
 file behavior. A successful batch submission requires a string native ID with
 at least one non-whitespace character.
 
-Attachment has the same ownership boundary. Both local and batch `attach`
-accept only an unbound `NEW` job. Invalid native IDs and failed local process
-lookups leave the job unbound and unchanged; one executor may not steal a job
-already attached to another. After attachment succeeds, every subsequent
-status observation sees the stable native ID.
+Attachment has the same ownership boundary, but not the same specification
+requirement. `attach()` reconnects to an existing native job instead of
+launching a new one. Both local and batch `attach()` must accept an unbound
+`NEW` `Job` whose `spec` is `None`; the caller need not reconstruct the original
+`JobSpec`. Submission-only specification validation must not reject this
+attachment. Invalid native IDs and failed local process lookups leave the job
+unbound and unchanged; one executor may not steal a job already attached to
+another. After attachment succeeds, every subsequent status observation sees
+the stable native ID.
 
 Successful local submission must make the process ID visible before the reaper
 can publish `QUEUED`, `ACTIVE`, or a terminal callback, including when a child

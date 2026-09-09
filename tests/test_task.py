@@ -1030,16 +1030,20 @@ class SubmissionLifecycleTests(unittest.TestCase):
         self.assertIs(job.executor, owner)
         self.assertEqual(job.native_id, str(os.getpid()))
 
-    def test_local_attachment_publishes_native_id_before_callbacks(self) -> None:
+    def test_local_attachment_accepts_none_spec_and_publishes_native_id(self) -> None:
         executor = JobExecutor.get_instance("local")
         native_id = str(os.getpid())
         observed: list[tuple[JobState, str | None]] = []
         job = Job()
+        self.assertIsNone(job.spec)
+        self.assertEqual(job.status.state, JobState.NEW)
+        self.assertIsNone(job.executor)
         job.set_job_status_callback(
             lambda current, status: observed.append((status.state, current.native_id)))
 
         executor.attach(job, native_id)
 
+        self.assertIs(job.executor, executor)
         self.assertEqual(job.status.state, JobState.ACTIVE)
         self.assertEqual(job.native_id, native_id)
         self.assertEqual(
@@ -1298,12 +1302,15 @@ class SubmissionLifecycleTests(unittest.TestCase):
             self.assertIs(job.executor, first)
             self.assertEqual(job.native_id, native_id)
 
-    def test_batch_attachment_publishes_native_id_before_polled_callbacks(self) -> None:
+    def test_batch_attachment_accepts_none_spec_and_publishes_native_id(self) -> None:
         with tempfile.TemporaryDirectory(prefix="psij-batch-attach-callback-") as td:
             executor = _OfflineRecoveryExecutor(Path(td))
             native_id = token("attached-")
             observed: list[tuple[JobState, str | None]] = []
             job = Job()
+            self.assertIsNone(job.spec)
+            self.assertEqual(job.status.state, JobState.NEW)
+            self.assertIsNone(job.executor)
             job.set_job_status_callback(
                 lambda current, status: observed.append((status.state, current.native_id)))
 
@@ -1311,6 +1318,8 @@ class SubmissionLifecycleTests(unittest.TestCase):
             executor.status_map[native_id] = JobStatus(JobState.ACTIVE)
             executor._queue_poll_thread._poll()
 
+            self.assertIs(job.executor, executor)
+            self.assertEqual(job.native_id, native_id)
             self.assertEqual(job.status.state, JobState.ACTIVE)
             self.assertTrue(observed)
             self.assertTrue(all(value == native_id for _state, value in observed))
